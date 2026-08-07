@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(D:\\\\Anaconda\\\\envs\\\\lop\\\\python.exe -c \"import inspect; from mlproj_manager.experiments import Experiment; print\\(inspect.getsource\\(Experiment.load_experiment_checkpoint\\)\\)\")",
+      "PowerShell(D:\\\\Anaconda\\\\envs\\\\lop\\\\python.exe -c \"import inspect; from mlproj_manager.experiments import Experiment; print\\(inspect.getsource\\(Experiment.get_latest_checkpoint_filename\\)\\)\")"
+    ]
+  }
+}

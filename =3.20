@@ -1,0 +1,8 @@
+Collecting zipp
+  Downloading zipp-3.20.2-py3-none-any.whl (9.2 kB)
+Installing collected packages: zipp
+  Attempting uninstall: zipp
+    Found existing installation: zipp 3.16.2
+    Uninstalling zipp-3.16.2:
+      Successfully uninstalled zipp-3.16.2
+Successfully installed zipp-3.20.2

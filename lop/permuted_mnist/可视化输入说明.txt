@@ -1,0 +1,46 @@
+plot_plasticity_metrics.py
+该可视化模块用于绘制损失下降量、可塑性指标Pn、参数变化量随任务索引变化的组合折线图，最终输出图像plasticity_metrics.png，模块仅读取单一csv格式文件：
+1. 文件基础属性：文件名称固定为plasticity.csv，为标准逗号分隔文本文件，文件首行是列名表头，每一行数据对应单一任务的完整指标信息；
+2. 文件强制必填列（程序内置校验，缺失任意一列会直接报错终止运行），共5列且列名大小写、文字不可修改：task_idx（任务索引）、loss_pre、loss_post、delta_norm_total、Pn（可塑性指标）；
+3. 文件依赖约束：模块绘图仅依靠该csv文件，无需配套其他辅助文件，文件读取路径可通过代码内CSV_PATH变量自定义调整。
+
+
+
+plot_compare.py(用这个)
+该模块用于多算法可塑性指标对比可视化，读取多份csv格式文件，绘制损失下降量、可塑性指标Pn、参数变化量的多曲线对比图，输出图像plasticity_metrics_comparison.png，文件相关要求分点如下：
+1. 文件数量与基础格式：模块支持同时读取BP、EWC、CBP、L2四种算法各自独立的csv文件，每份文件均为标准逗号分隔文本文件，首行为列名表头，单文件存储单一算法全部任务指标数据，各算法csv文件名无强制统一要求，可在代码ALGORITHMS配置项中单独指定路径；
+2. 每份csv强制必填列（程序内置校验，缺失任意一列会直接判定文件无效并跳过该算法），共5列且列名大小写、文字不可修改：task_idx（任务索引）、loss_pre、loss_post、delta_norm_total、Pn（可塑性指标）；
+3. 文件依赖约束：模块无公共统一输入文件，每种算法对应一份独立csv文件，仅依靠多份csv文件完成绘图，无需配套其他辅助文件，各csv文件路径、该算法最大任务数均可在代码ALGORITHMS列表内自定义修改。
+
+
+visualize_nc3.py
+该模块为NC3数据t-SNE可视化独立模块，对样本向量执行L2归一化后完成全局t-SNE降维，读取若干pkl格式数据文件，文件相关要求分点如下：
+1. 文件存储目录规则：所有输入pkl文件统一存放在根目录下的子文件夹nc3_saved_data中，代码会自动检索该目录下符合命名规范的文件，目录缺失会直接终止程序；
+2. 文件命名规范：单个任务对应独立pkl文件，文件名固定格式为nc3_data_task_{任务索引}.pkl，{任务索引}为数字，程序依靠文件名提取任务编号，命名格式错误的文件无法被识别加载；
+3. pkl文件内部存储结构（pickle序列化字典，关键字不可缺失），字典必须包含4个键值对：class_centers（10行D维数组，10个类的特征中心）、classifier_weights（10行D维数组，10个分类器权重向量）、sample_features（2000行D维数组，单任务全部样本特征向量）、sample_labels（长度2000一维数组，对应样本分类标签，取值0-9）；
+4. 数据格式约束：class_centers、classifier_weights、sample_features均为浮点型二维矩阵，sample_labels为整型一维数组，数组维度固定不可变更，文件内不可存在缺失键、空数组、非数值型数据；
+
+
+data_preprocess.py（先）
+该模块为持续学习多范式数据预处理工具，读取多份csv格式原始结果文件，汇总持续、独立、联合三种训练范式的准确率、NC指标、死亡神经元、训练终止统计，输出标准化预处理csv表格，输入文件相关要求分点阐述如下：
+1. 目录结构规范：根目录为xxx/(可修改)，根目录下需内置joint_results子文件夹存放联合训练文件，持续学习文件存放于根目录，独立学习文件存放于根目录INDEPENDENT_DIR路径，目录缺失会触发文件找不到报错；
+2. 持续学习输入csv文件清单及列要求：①continual_forward_test_results.csv，必须包含current_train_task_idx、test_task_idx、accuracy三列，用于构建任务准确率矩阵；②0.csv，需包含task_idx、nc1、iter、reached_threshold，以及若干以dead_neurons_开头的列，同时承担NC时序、死亡神经元、训练终止统计三类数据读取；③0_0.csv，需包含iter、nc1列，用于持续学习中间NC时序数据；
+3. 独立学习输入csv文件清单及列要求：①independent_intermediate_results.csv，包含iter、nc1列，独立学习中间NC时序；②independent_final_results.csv，必须包含recent_accuracy、nc1、reached_threshold及dead_neurons_开头列，同时提供独立学习最终准确率、NC1、死亡神经元、终止统计；
+4. 联合学习输入csv文件清单及列要求：①joint_intermediate_results.csv，包含total_trained_samples、nc1列，联合训练中间NC时序；②joint_model_per_task_accuracy_*_tasks.csv，文件名匹配正则joint_model_per_task_accuracy_\d+_tasks\.csv，自动选取最新文件，需包含accuracy、nc1两列，用于联合训练平均指标计算；
+5. 通用csv文件格式约束：所有输入文件均为标准逗号分隔csv，首行为列名表头；
+
+
+plot_visualization.py（data_preprocess.py后运行）
+该模块为持续学习多范式论文绘图可视化工具，可绘制准确率热力图（使用）、NC指标时序曲线（使用）、死亡神经元热力图、训练终止条件饼图、训练范式对比柱状图，文件相关要求分点阐述如下：
+1. 目录结构规范：脚本同级目录下需存在xxx/根文件夹，内部包含joint_results子文件夹存放联合训练原始数据；同时脚本同级目录需存在preprocessed_data文件夹，存放data_preprocess.py预处理完成后的标准化csv文件，缺失任一目录会触发文件不存在报错；
+2. 使用预处理文件夹preprocessed_data内文件及原始文件
+
+
+
+plot_isotropy_equinormity.py
+该模块用于绘制持续、联合、独立三种训练范式下各任务等角性与等范数对比散点图，读取3份csv格式原始结果文件，文件相关要求分点阐述如下：
+1. 目录存储规范：根目录固定为xxx/，根目录下需存在joint_results子文件夹用于存放联合训练数据，持续学习、独立学习csv文件直接放置在xxx/根目录，目录缺失会触发文件读取报错；
+2. 持续学习输入文件：文件名为0.csv，必须包含isotropy、equinormity、task_idx三列，isotropy列存储各任务各向同性数值，equinormity列存储等范数数值，task_idx列为对应任务编号；
+3. 独立学习输入文件：文件名为independent_final_results.csv，必须包含isotropy、equinormity、task_idx三列，列数据含义与持续学习文件完全一致；
+4. 联合训练输入文件：文件命名格式固定为joint_model_per_task_accuracy_n_tasks.csv（数字n对应代码内NUM_TASKS参数），存放于xxx/joint_results/路径下，必须包含isotropy、equinormity、task_idx三列；
+5. 通用csv格式约束：所有输入文件均为标准逗号分隔csv文件，文件首行为列名表头，isotropy、equinormity列存储浮点型指标数值，task_idx列为整型任务编号，文件不可存在缺失列、空值、非数字文本；

@@ -1,0 +1,38 @@
+{
+  "_model_description_": "Task-continual learning on CIFAR-100 (20 tasks × 5 classes). Set 'agent' to 'bp', 'cbp', or 'ewc'.",
+
+  "_comment_data_": "Data paths — set to empty to auto-detect relative to this script",
+  "data_path": "",
+  "results_dir": "",
+  "experiment_name": "task_continual_learning",
+  "num_workers": 0,
+
+  "_comment_agent_": "========== Task settings ==========",
+  "num_tasks": 3,
+  "num_epochs_per_task": 200,
+  "enable_joint_training": true,
+  "enable_independent_training": true,
+
+  "_comment_agent_sel_": "========== Algorithm selection ==========",
+  "_comment_agent_desc_": "'bp': standard SGD  |  'cbp': Continual Backprop  |  'ewc': Elastic Weight Consolidation",
+  "agent": "bp",
+
+  "_comment_opt_": "========== Optimizer (shared by all agents) ==========",
+  "stepsize": 0.1,
+  "weight_decay": 0.0005,
+  "momentum": 0.9,
+
+  "_comment_cbp_": "========== CBP parameters (only used when agent='cbp') ==========",
+  "replacement_rate": 0.00001,
+  "utility_function": "contribution",
+  "maturity_threshold": 1000,
+
+  "_comment_ewc_": "========== EWC parameters (only used when agent='ewc') ==========",
+  "ewc_lambda": 5000.0,
+  "ewc_fisher_sample_size": 2000,
+
+  "_comment_reset_": "========== Network resetting (currently unused in task-continual setup) ==========",
+  "reset_head": false,
+  "reset_network": false,
+  "early_stopping": true
+}

@@ -1,0 +1,2 @@
+num_tasks,accuracy,nc1,nc2,nc3,nc4,reached_threshold,epochs_trained
+3,0.5193333333333333,"tensor(2.6168, device='cuda:0')",0.4137195646762848,0.16964586079120636,0.732,False,200
