@@ -7,10 +7,7 @@ import json
 import argparse
 import csv
 import math
-from functools import partialmethod
-
 # third party libraries
-from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
@@ -25,10 +22,16 @@ from mlproj_manager.file_management.file_and_directory_management import store_o
 
 from lop.nets.torchvision_modified_resnet import build_resnet18, kaiming_init_resnet_module
 from lop.incremental_cifar.learners import build_learner
+from lop.incremental_cifar.tiny_imagenet_dataset import TinyImageNetDataSet
 from lop.neural_collapse_original import NC1, NC4, _get_feature_means, _get_classifier_weights
 from lop.utils.neural_collapse import NC3 as NC3_full  # 返回 (nc3_mean, nc3_max, nc3_min)
 from lop.utils.neural_collapse import NC2 as NC2_full  # 返回 (nc2, equinorm, equiangular)
 from lop.utils.neural_collapse import clear_feature_means_cache
+# NC3_full/NC2_full 内部用的其实是 utils 模块自己的 _get_feature_means/_get_classifier_weights
+# （与上方 neural_collapse_original 里的同名函数是两套独立实现）。诊断要复现 NC3_full
+# 的确切数值，就必须复用 utils 这一套，故在此加别名导入。
+from lop.utils.neural_collapse import _get_feature_means as _utils_get_feature_means
+from lop.utils.neural_collapse import _get_classifier_weights as _utils_get_classifier_weights
 
 
 def subsample_cifar_data_set(sub_sample_indices, cifar_data: CifarDataSet):
@@ -80,9 +83,6 @@ class IncrementalCIFARExperiment(Experiment):
         # define torch device
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # disable tqdm if verbose is enabled
-        tqdm.__init__ = partialmethod(tqdm.__init__, disable=self.verbose)
-
         """ For reproducibility """
         random_seeds = get_random_seeds()
         self.random_seed = random_seeds[self.run_index]
@@ -112,18 +112,53 @@ class IncrementalCIFARExperiment(Experiment):
             print(Warning("Resetting the whole network supersedes resetting the head of the network. There's no need to set both to True."))
         self.early_stopping = access_dict(exp_params, "early_stopping", default=False, val_type=bool)
 
+        """ Dataset configuration """
+        self.dataset = access_dict(exp_params, "dataset", default="cifar100", val_type=str,
+                                   choices=["cifar100", "tiny_imagenet"])
+        if self.dataset == "tiny_imagenet":
+            self.num_classes = 200             # Tiny ImageNet 原始类别数
+            self.image_dims = (64, 64, 3)
+            self.mean = (0.4802, 0.4481, 0.3975)
+            self.std = (0.2302, 0.2265, 0.2262)
+        else:
+            self.num_classes = 100             # CIFAR-100 原始类别数
+            self.image_dims = (32, 32, 3)
+            self.mean = (0.5071, 0.4865, 0.4409)
+            self.std = (0.2673, 0.2564, 0.2762)
+
+        # 每类加载的图片总数（CIFAR-100 / Tiny ImageNet train 均为 500 张/类）。
+        # 调小该值可减少训练样本量（例如 300 → 每类 250 张训练 + 50 张验证）。
+        self.num_images_per_class = access_dict(exp_params, "num_images_per_class", default=500, val_type=int)
+        self.num_val_samples_per_class = 50
+        self.num_train_samples_per_class = self.num_images_per_class - self.num_val_samples_per_class
+
         """ Training constants """
         self.num_tasks = access_dict(exp_params, "num_tasks", default=20, val_type=int)
         self.num_classes_per_task = 5          # 每 task 5 类，标签 0-4
         self.num_epochs_per_task = access_dict(exp_params, "num_epochs_per_task", default=200, val_type=int)
         self.num_epochs = self.num_tasks * self.num_epochs_per_task
         self.target_accuracy = access_dict(exp_params, "target_accuracy", default=0.96, val_type=float)
+        self.nc4_threshold = access_dict(exp_params, "nc4_threshold", default=0.96, val_type=float)
         self.enable_joint_training = access_dict(exp_params, "enable_joint_training", default=True, val_type=bool)
+        self.enable_continual_training = access_dict(exp_params, "enable_continual_training", default=True, val_type=bool)
         self.enable_independent_training = access_dict(exp_params, "enable_independent_training", default=True, val_type=bool)
+        self.independent_epochs = access_dict(exp_params, "independent_epochs", default=20, val_type=int)
+        # 独立训练 NC4 提前停止：训练中 NC4 达到该值则提前结束当前 task
+        self.independent_nc4_target = access_dict(exp_params, "independent_nc4_target", default=0.95, val_type=float)
+        # 独立训练 NC 检查间隔（epoch 数）：每隔多少 epoch 计算一次 NC 并检查提前停止条件
+        self.independent_nc_check_interval = access_dict(exp_params, "independent_nc_check_interval", default=5, val_type=int)
+        # joint 模型在拼接数据集上训练的轮数（仿 independent_epochs）。缺省沿用 num_epochs_per_task 以保持原行为。
+        self.joint_epochs = access_dict(exp_params, "joint_epochs", default=self.num_epochs_per_task, val_type=int)
+        # joint 训练的提前停准确率阈值。应与 target_accuracy 保持一致（两侧同 early-stop
+        # 口径，NC 才停在同一训练充分度上）；缺省沿用 target_accuracy。
+        self.joint_target_accuracy = access_dict(exp_params, "joint_target_accuracy", default=self.target_accuracy, val_type=float)
+        # LR schedule（continual 与 joint 共用同一协议，见 _lr_for_epoch）
+        self.lr_schedule = access_dict(exp_params, "lr_schedule", default="step", val_type=str)
+        self.lr_decay_milestones = access_dict(exp_params, "lr_decay_milestones", default=[100, 200, 300], val_type=list)
+        self.lr_decay_gamma = access_dict(exp_params, "lr_decay_gamma", default=0.5, val_type=float)
+        self.lr_min_ratio = access_dict(exp_params, "lr_min_ratio", default=0.01, val_type=float)
         self.batch_sizes = {"train": 90, "test": 100, "validation":50}
-        self.num_classes = 100                 # CIFAR-100 原始类别数
-        self.image_dims = (32, 32, 3)
-        self.num_images_per_class = 450
+        self.num_candidate_tasks = self.num_classes // self.num_classes_per_task
 
         """ Network set up """
         # initialize network with 5-class output (shared across all tasks)
@@ -131,8 +166,12 @@ class IncrementalCIFARExperiment(Experiment):
         self.net.apply(kaiming_init_resnet_module)
 
         # initialize optimizer
+        # 注意：weight_decay 必须为 0 —— 本项目用**解耦** weight decay：衰减在 learner 的
+        # _apply_decoupled_weight_decay 里按 (1 - lr*wd) 显式施加，且只作用于 ndim>1 的权重
+        # （BN 的 γ/β 与所有 bias 不衰减）。若在这里传 weight_decay，衰减项会先进入动量缓冲，
+        # 稳态被放大 1/(1-momentum)=10 倍，强度远超名义 λ。
         self.optim = torch.optim.SGD(self.net.parameters(), lr=self.stepsize, momentum=self.momentum,
-                                     weight_decay=self.weight_decay)
+                                     weight_decay=0.0)
 
         # define loss function
         self.loss = torch.nn.CrossEntropyLoss(reduction="mean")
@@ -148,6 +187,8 @@ class IncrementalCIFARExperiment(Experiment):
             optim=self.optim,
             loss_fn=self.loss,
             device=self.device,
+            # 解耦 weight decay 系数（优化器里已置 0，衰减在 learner 里施加）
+            weight_decay=self.weight_decay,
             # CBP kwargs
             replacement_rate=access_dict(exp_params, "replacement_rate", default=1e-4, val_type=float),
             maturity_threshold=access_dict(exp_params, "maturity_threshold", default=100, val_type=int),
@@ -159,6 +200,12 @@ class IncrementalCIFARExperiment(Experiment):
 
         """ For data partitioning """
         self.all_classes = np.random.permutation(self.num_classes)
+        # 参与训练/评估的 task 类列表（每项 5 类）。初始为完整候选池（num_candidate_tasks 项），
+        # 独立训练 NC4 gating 后裁剪为接受的 num_tasks 项。
+        self.task_classes = [
+            self.all_classes[i * self.num_classes_per_task:(i + 1) * self.num_classes_per_task]
+            for i in range(self.num_candidate_tasks)
+        ]
         self.best_accuracy = torch.tensor(0.0, device=self.device, dtype=torch.float32)
         self.best_accuracy_model_parameters = {}
 
@@ -171,7 +218,7 @@ class IncrementalCIFARExperiment(Experiment):
         self.plasticity_params_before = None  # model state_dict before first epoch
 
         """ For per-task evaluation """
-        self.per_task_test_data = []  # list of dicts, one per task: {"data": np.array, "labels": np.array}
+        self.per_task_train_data = []  # list of dicts, one per task: {"data": np.array, "labels": np.array}
 
         """ For creating experiment checkpoints """
         self.experiment_checkpoints_dir_path = os.path.join(self.results_dir, "experiment_checkpoints")
@@ -190,7 +237,7 @@ class IncrementalCIFARExperiment(Experiment):
         Initializes the summaries for the experiment
         """
         number_of_tasks = np.arange(self.num_epochs // self.num_epochs_per_task) + 1
-        number_of_image_per_task = self.num_images_per_class * self.num_classes_per_task
+        number_of_image_per_task = self.num_train_samples_per_class * self.num_classes_per_task
         bin_size = (self.running_avg_window * self.batch_sizes["train"])
         total_checkpoints = int(np.sum(number_of_tasks * self.num_epochs_per_task * number_of_image_per_task // bin_size))
 
@@ -252,10 +299,9 @@ class IncrementalCIFARExperiment(Experiment):
         :param cifar_data: CifarDataSet instance (should be in full-data state before calling)
         :param task_id: index of the task (0..19)
         """
-        task_classes = self.all_classes[task_id * self.num_classes_per_task:
-                                        (task_id + 1) * self.num_classes_per_task]
+        task_classes = self.task_classes[task_id]
 
-        labels_full = cifar_data.data["labels"]  # (N, 100) one-hot
+        labels_full = cifar_data.data["labels"]  # (N, num_classes) one-hot
         if torch.is_tensor(labels_full):
             labels_full = labels_full.cpu().numpy()
 
@@ -357,30 +403,30 @@ class IncrementalCIFARExperiment(Experiment):
         self.running_accuracy *= 0.0
         self.current_running_avg_step += 1
 
-    def _store_test_summaries(self, test_data: DataLoader, val_data: DataLoader, epoch_number: int, epoch_runtime: float):
-        """ Computes test summaries and stores them in results dir """
+    def _store_train_summaries(self, train_dataloader: DataLoader, epoch_number: int, epoch_runtime: float):
+        """ Computes training set summaries (loss & accuracy) and stores them in results dir """
 
         self.results_dict["epoch_runtime"][epoch_number] += torch.tensor(epoch_runtime, dtype=torch.float32)
 
         self.net.eval()
-        for data_name, data_loader, compare_to_best in [("test", test_data, False), ("validation", val_data, True)]:
-            # evaluate on data
-            evaluation_start_time = time.perf_counter()
-            loss, accuracy = self.evaluate_network(data_loader)
-            evaluation_time = time.perf_counter() - evaluation_start_time
+        evaluation_start_time = time.perf_counter()
+        loss, accuracy = self.evaluate_network(train_dataloader)
+        evaluation_time = time.perf_counter() - evaluation_start_time
 
-            if compare_to_best:
-                if accuracy > self.best_accuracy:
-                    self.best_accuracy = accuracy
-                    self.best_accuracy_model_parameters = deepcopy(self.net.state_dict())
+        if accuracy > self.best_accuracy:
+            self.best_accuracy = accuracy
+            self.best_accuracy_model_parameters = deepcopy(self.net.state_dict())
 
-            # store summaries
-            self.results_dict[data_name + "_evaluation_runtime"][epoch_number] += torch.tensor(evaluation_time, dtype=torch.float32)
-            self.results_dict[data_name + "_loss_per_epoch"][epoch_number] += loss
-            self.results_dict[data_name + "_accuracy_per_epoch"][epoch_number] += accuracy
+        # store summaries (fill both test and validation slots with train-set results for compatibility)
+        self.results_dict["test_evaluation_runtime"][epoch_number] += torch.tensor(evaluation_time, dtype=torch.float32)
+        self.results_dict["test_loss_per_epoch"][epoch_number] += loss
+        self.results_dict["test_accuracy_per_epoch"][epoch_number] += accuracy
+        self.results_dict["validation_evaluation_runtime"][epoch_number] += torch.tensor(evaluation_time, dtype=torch.float32)
+        self.results_dict["validation_loss_per_epoch"][epoch_number] += loss
+        self.results_dict["validation_accuracy_per_epoch"][epoch_number] += accuracy
 
-            # print progress
-            self._print("\t\t{0} accuracy: {1:.4f}".format(data_name, accuracy))
+        # print progress
+        self._print("\t\ttrain accuracy: {0:.4f}".format(accuracy))
 
         self.net.train()
         self._print("\t\tEpoch run time in seconds: {0:.4f}".format(epoch_runtime))
@@ -432,9 +478,13 @@ class IncrementalCIFARExperiment(Experiment):
                       num_classes=self.num_classes_per_task, use_cache=True)
         self.net.train()
 
+        # NC1 返回 tensor，统一转为 Python float
+        if isinstance(nc1, torch.Tensor):
+            nc1 = nc1.item()
         return nc1, nc2, nc3, nc3_max, nc3_min, nc4, equiangular, equinorm
 
     def _save_nc_csv(self):
+        
         """
         Save per-task NC metrics to a CSV file for later analysis / plotting.
         File is written to: <results_dir>/nc_metrics.csv
@@ -545,8 +595,9 @@ class IncrementalCIFARExperiment(Experiment):
         """
         net = build_resnet18(num_classes=self.num_classes_per_task, norm_layer=torch.nn.BatchNorm2d)
         net.apply(kaiming_init_resnet_module)
+        # weight_decay=0：与 continual 侧一致，衰减走 learner 的解耦实现
         optim = torch.optim.SGD(net.parameters(), lr=self.stepsize, momentum=self.momentum,
-                                weight_decay=self.weight_decay)
+                                weight_decay=0.0)
         return net.to(self.device), optim
 
     def _collect_all_tasks_data(self, training_data, val_data, test_data):
@@ -558,7 +609,7 @@ class IncrementalCIFARExperiment(Experiment):
         """
         train_data_list, val_data_list, test_data_list = [], [], []
 
-        for task_id in range(self.num_tasks):
+        for task_id in range(len(self.task_classes)):
             # restore and remap training data
             self._restore_from_base(training_data, self.base_data["train"])
             self._remap_labels_to_task(training_data, task_id)
@@ -593,21 +644,24 @@ class IncrementalCIFARExperiment(Experiment):
 
         return train_data_list, val_data_list, test_data_list
 
-    @staticmethod
-    def _make_simple_dataset(data_dict):
+    def _make_simple_dataset(self, data_dict):
         """
         Create a simple torch Dataset from a dict with "data" (np array) and "labels" (np array).
-        Handles HWC→CHW conversion and CIFAR-100 normalization.
+        Handles HWC→CHW conversion and dataset-specific normalization.
         Yields (image, label) tuples with integer labels (not one-hot).
         """
-        # data is raw (N, H, W, C) uint8 in [0, 255]
-        images = torch.from_numpy(data_dict["data"]).float() / 255.0
+        # CifarDataSet/TinyImageNetDataSet(image_normalization="max") 已将数据归一化到 [0, 1]，无需再除255
+        data_arr = data_dict["data"]
+        if data_arr.dtype == np.uint8 or data_arr.max() > 1.0:
+            images = torch.from_numpy(data_arr).float() / 255.0  # uint8 [0,255]
+        else:
+            images = torch.from_numpy(data_arr).float()           # 已是 float [0,1]
         # HWC → CHW
         if images.ndim == 4 and images.shape[-1] == 3:
             images = images.permute(0, 3, 1, 2)
-        # CIFAR-100 normalization
-        mean = torch.tensor([0.5071, 0.4865, 0.4409]).view(1, 3, 1, 1)
-        std = torch.tensor([0.2673, 0.2564, 0.2762]).view(1, 3, 1, 1)
+        # dataset-specific normalization
+        mean = torch.tensor(self.mean).view(1, 3, 1, 1)
+        std = torch.tensor(self.std).view(1, 3, 1, 1)
         images = (images - mean) / std
 
         labels_array = data_dict["labels"]
@@ -623,6 +677,11 @@ class IncrementalCIFARExperiment(Experiment):
         """
         Joint training: concatenate all tasks' data and train one model from scratch.
         Results are saved to <results_dir>/joint/
+
+        NOTE on NC evaluation: the joint model is trained on the concatenated dataset,
+        whose labels 0-4 merge each task's same-position classes into one "super-class".
+        Training-time and final NC are therefore computed on this merged train_loader
+        (the same label partition the model is trained with).
         """
         joint_dir = os.path.join(self.results_dir, "joint")
         os.makedirs(joint_dir, exist_ok=True)
@@ -630,6 +689,13 @@ class IncrementalCIFARExperiment(Experiment):
         self._print("\n" + "=" * 60)
         self._print("\t=== Joint Training: all {0} tasks together ===".format(self.num_tasks))
         self._print("=" * 60)
+
+        # 口径对齐（对齐 permuted MNIST）：joint 与 continual 必须用同一 early-stop 阈值。
+        # 阈值偏高会把 joint 训到更接近塌缩的状态，两侧 NC 就停在不同训练充分度上、数值不可比。
+        if abs(self.joint_target_accuracy - self.target_accuracy) > 1e-9:
+            self._print("\t[Joint][WARN] joint_target_accuracy={0:.4f} != target_accuracy={1:.4f}；"
+                        "两侧 NC 的训练充分度不同，数值不可直接比较。".format(
+                            self.joint_target_accuracy, self.target_accuracy))
 
         # collect all task data
         train_list, val_list, test_list = self._collect_all_tasks_data(
@@ -660,19 +726,83 @@ class IncrementalCIFARExperiment(Experiment):
         # build learner (BP only for joint training)
         joint_learner = build_learner(
             agent="bp", net=net, optim=optim, loss_fn=loss_fn, device=self.device,
+            weight_decay=self.weight_decay,
         )
 
         # create datasets and dataloaders
         train_dataset = self._make_simple_dataset(joint_train_data)
-        val_dataset = self._make_simple_dataset(joint_val_data)
-        test_dataset = self._make_simple_dataset(joint_test_data)
 
         train_loader = DataLoader(train_dataset, batch_size=self.batch_sizes["train"],
                                   shuffle=True, num_workers=self.num_workers)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_sizes["validation"],
-                                shuffle=False, num_workers=self.num_workers)
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_sizes["test"],
-                                 shuffle=False, num_workers=self.num_workers)
+
+        # Per-task loaders, one per task (labels are the task's real 0-4 classes).
+        # Used only for the per-task accuracy/NC evaluation at the end; training-time
+        # and final NC are computed on the merged train_loader above.
+        task_train_loaders = [
+            DataLoader(self._make_simple_dataset(task_data),
+                       batch_size=self.batch_sizes["train"],
+                       shuffle=False, num_workers=self.num_workers)
+            for task_data in train_list
+        ]
+
+        # ========== 诊断：检查联合训练输入数据和模型是否工作 ==========
+        diag_path = os.path.join(joint_dir, "diagnostic.log")
+        with open(diag_path, "w") as diag:
+            diag.write("=== Joint Training Diagnostic ===\n")
+            # 1. 数据维度
+            diag.write("joint_train_data['data'] shape: {0}, dtype: {1}\n".format(
+                joint_train_data["data"].shape, joint_train_data["data"].dtype))
+            diag.write("joint_train_data['labels'] shape: {0}, dtype: {1}\n".format(
+                joint_train_data["labels"].shape, joint_train_data["labels"].dtype))
+            # 2. 标签分布
+            label_counts = np.sum(joint_train_data["labels"], axis=0)
+            diag.write("Label distribution (per-class sample count): {0}\n".format(label_counts))
+            diag.write("Total samples: {0}\n".format(len(joint_train_data["data"])))
+            # 3. 取一个 batch 检查
+            sample_batch = next(iter(train_loader))
+            sample_images, sample_labels = sample_batch
+            diag.write("Batch images shape: {0}, dtype: {1}\n".format(sample_images.shape, sample_images.dtype))
+            diag.write("Batch images range: [{0:.4f}, {1:.4f}]\n".format(
+                sample_images.min().item(), sample_images.max().item()))
+            diag.write("Batch labels shape: {0}, unique: {1}\n".format(
+                sample_labels.shape, sample_labels.unique().tolist()))
+            # 4. 前向传播测试
+            net.eval()
+            with torch.no_grad():
+                test_out = net(sample_images.to(self.device))
+                test_probs = torch.softmax(test_out, dim=1)
+                diag.write("Model output shape: {0}\n".format(test_out.shape))
+                diag.write("Output logits range: [{0:.6f}, {1:.6f}]\n".format(
+                    test_out.min().item(), test_out.max().item()))
+                diag.write("Softmax mean per class: {0}\n".format(
+                    test_probs.mean(dim=0).tolist()))
+                diag.write("Predicted class distribution: {0}\n".format(
+                    torch.bincount(test_out.argmax(dim=1), minlength=5).tolist()))
+            # 5. 单步训练测试：检查梯度和权重变化
+            net.train()
+            before_fc_weight = net.fc.weight.data.clone()
+            test_images = sample_images.to(self.device)
+            test_labels_int = sample_labels.to(self.device)
+            test_labels_oh = torch.nn.functional.one_hot(test_labels_int, num_classes=5).float()
+            for p in net.parameters():
+                p.grad = None
+            test_preds = net(test_images)
+            test_loss = loss_fn(test_preds, test_labels_oh)
+            test_loss.backward()
+            # 检查梯度
+            fc_grad_norm = net.fc.weight.grad.norm().item()
+            total_grad_norm = sum(p.grad.norm().item() ** 2 for p in net.parameters() if p.grad is not None) ** 0.5
+            diag.write("Loss on first batch: {0:.6f}  (ln(5)={1:.6f})\n".format(test_loss.item(), math.log(5)))
+            diag.write("FC weight grad norm: {0:.6f}\n".format(fc_grad_norm))
+            diag.write("Total grad norm: {0:.6f}\n".format(total_grad_norm))
+            # 执行一步更新
+            optim.step()
+            after_fc_weight = net.fc.weight.data.clone()
+            fc_weight_change = (after_fc_weight - before_fc_weight).norm().item()
+            diag.write("FC weight change after 1 step: {0:.6f}\n".format(fc_weight_change))
+            diag.write("=== Diagnostic End ===\n")
+        self._print("\tDiagnostic saved to: {0}".format(diag_path))
+        # ========== 诊断结束 ==========
 
         # intermediate results file
         intermediate_file = os.path.join(joint_dir, "joint_intermediate.csv")
@@ -685,9 +815,18 @@ class IncrementalCIFARExperiment(Experiment):
         best_val_acc = 0.0
         best_model_state = None
 
-        for epoch in tqdm(range(self.num_epochs_per_task), desc="Joint Training"):
+        for epoch in range(self.joint_epochs):
             if joint_reached_threshold:
                 break
+
+            # ---- 与持续侧共用同一 LR 协议（口径对齐：两侧 NC 必须在同一 LR 状态下测量）----
+            joint_lr = self._lr_for_epoch(epoch, self.joint_epochs)
+            if joint_lr is not None:
+                for g in optim.param_groups:
+                    g['lr'] = joint_lr
+                if epoch == 0:
+                    self._print("\t[Joint][LR] schedule={0}, stepsize={1:.4f}, joint_epochs={2}".format(
+                        self.lr_schedule, self.stepsize, self.joint_epochs))
 
             # ---- train one epoch ----
             net.train()
@@ -709,43 +848,34 @@ class IncrementalCIFARExperiment(Experiment):
             train_loss = total_loss / total_samples
             train_acc = total_correct / total_samples
 
-            # ---- evaluate ----
+            # ---- evaluate on training set ----
             net.eval()
-            test_loss, test_correct, test_samples = 0.0, 0, 0
+            train_eval_loss, train_eval_correct, train_eval_samples = 0.0, 0, 0
             with torch.no_grad():
-                for images, labels in test_loader:
+                for images, labels in train_loader:
                     images, labels = images.to(self.device), labels.to(self.device)
                     labels_oh = torch.nn.functional.one_hot(labels, num_classes=self.num_classes_per_task).float()
                     logits = net(images)
-                    test_loss += loss_fn(logits, labels_oh).item() * images.size(0)
-                    test_correct += (logits.argmax(dim=1) == labels).sum().item()
-                    test_samples += images.size(0)
-            test_loss_val = test_loss / test_samples
-            test_acc = test_correct / test_samples
+                    train_eval_loss += loss_fn(logits, labels_oh).item() * images.size(0)
+                    train_eval_correct += (logits.argmax(dim=1) == labels).sum().item()
+                    train_eval_samples += images.size(0)
+            train_eval_loss_val = train_eval_loss / train_eval_samples
+            train_eval_acc = train_eval_correct / train_eval_samples
 
-            # eval on val set for best model tracking
-            val_correct, val_samples = 0, 0
-            with torch.no_grad():
-                for images, labels in val_loader:
-                    images, labels = images.to(self.device), labels.to(self.device)
-                    logits = net(images)
-                    val_correct += (logits.argmax(dim=1) == labels).sum().item()
-                    val_samples += images.size(0)
-            val_acc = val_correct / val_samples
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            if train_eval_acc > best_val_acc:
+                best_val_acc = train_eval_acc
                 best_model_state = deepcopy(net.state_dict())
 
-            self._print("\t[Joint] Epoch {0}: train_acc={1:.4f}, test_acc={2:.4f}".format(
-                epoch + 1, train_acc, test_acc))
+            self._print("\t[Joint] Epoch {0}: train_acc={1:.4f}, train_eval_acc={2:.4f}".format(
+                epoch + 1, train_acc, train_eval_acc))
 
-            # ---- compute NC every 10 epochs ----
+            # ---- compute NC every 10 epochs (on the merged training loader) ----
             nc1, nc2, nc3, nc3_max, nc3_min, nc4 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
             _iso, _equi = 0.0, 0.0
             if (epoch + 1) % 10 == 0:
                 try:
-                    nc1, nc2, nc3, nc3_max, nc3_min, nc4, _iso, _equi = self._compute_nc_on_simple_loader(
-                        net, test_loader)
+                    nc1, nc2, nc3, nc3_max, nc3_min, nc4, _iso, _equi = \
+                        self._compute_nc_on_simple_loader(net, train_loader)
                     self._print("\t[Joint] Epoch {0}: NC1={1:.4f}, NC2={2:.4f}, NC3={3:.4f}, NC4={4:.4f}".format(
                         epoch + 1, nc1, nc2, nc3, nc4))
                 except Exception as e:
@@ -754,31 +884,23 @@ class IncrementalCIFARExperiment(Experiment):
             # save intermediate
             with open(intermediate_file, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([epoch + 1, train_loss, train_acc, test_loss_val, test_acc,
+                writer.writerow([epoch + 1, train_loss, train_acc, train_eval_loss_val, train_eval_acc,
                                  nc1, nc2, nc3, nc4])
 
-            # early stop check (train accuracy)
-            if train_acc >= self.target_accuracy:
+            # early stop check (train accuracy; joint has its own threshold)
+            if train_acc >= self.joint_target_accuracy:
                 joint_reached_threshold = True
                 self._print("\t[Joint] Target train accuracy {0:.2%} reached at epoch {1}, stopping.".format(
-                    self.target_accuracy, epoch + 1))
+                    self.joint_target_accuracy, epoch + 1))
 
         # restore best model
         if best_model_state is not None:
             net.load_state_dict(best_model_state)
 
-        # final NC computation
-        net.eval()
-        try:
-            nc1, nc2, nc3, nc3_max, nc3_min, nc4, _iso, _equi = self._compute_nc_on_simple_loader(net, test_loader)
-        except Exception as e:
-            self._print("\t[Joint] Final NC failed: {0}".format(e))
-            nc1, nc2, nc3, nc3_max, nc3_min, nc4 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-
-        # final accuracy
+        # final accuracy (on training set)
         final_correct, final_samples = 0, 0
         with torch.no_grad():
-            for images, labels in test_loader:
+            for images, labels in train_loader:
                 images, labels = images.to(self.device), labels.to(self.device)
                 logits = net(images)
                 final_correct += (logits.argmax(dim=1) == labels).sum().item()
@@ -787,40 +909,30 @@ class IncrementalCIFARExperiment(Experiment):
 
         self._print("\t[Joint] Final accuracy: {0:.4f}".format(final_acc))
 
-        # save results
-        results_file = os.path.join(joint_dir, "joint_results.csv")
-        with open(results_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["num_tasks", "accuracy", "nc1", "nc2", "nc3", "nc4",
-                             "reached_threshold", "epochs_trained"])
-            writer.writerow([self.num_tasks, final_acc, nc1, nc2, nc3, nc4,
-                             joint_reached_threshold, epoch + 1])
-
-        # save model
-        torch.save(net.state_dict(), os.path.join(joint_dir, "joint_model.pth"))
-
         # =====================================================================
-        # Per-task evaluation: evaluate joint model on each task individually
+        # Per-task NC3 评估（在保存最终结果之前，用于定义 NC3 下界）
+        # NC3 定义为 per-task NC3 的最小值（下界），而非 merged loader 的均值。
+        # 原因：merged loader 上不同 task 的子簇均值取平均后可能与 W_k 偶然对齐，
+        #       导致 merged NC3 虚假偏低（平均掩盖碎片化），per-task NC3 下界更准确。
         # =====================================================================
-        self._print("\n\t[Joint] Per-task evaluation on all {0} tasks...".format(self.num_tasks))
-        per_task_file = os.path.join(joint_dir, "joint_per_task_results.csv")
-        with open(per_task_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["task_idx", "accuracy", "num_samples", "nc1", "nc2", "nc3", "nc4",
-                             "isotropy", "equinormity"])
-
+        self._print("\n\t[Joint] Per-task NC3 evaluation for lower-bound computation...")
         net.eval()
-        joint_iso_equi = []  # 收集每个 task 的 (isotropy, equinormity)
-        for task_id in range(self.num_tasks):
-            task_test_dataset = self._make_simple_dataset(test_list[task_id])
-            task_test_loader = DataLoader(task_test_dataset,
-                                          batch_size=self.batch_sizes["test"],
-                                          shuffle=False, num_workers=self.num_workers)
+        per_task_nc3_values = []
+        per_task_nc1_values = []
+        per_task_nc2_values = []
+        per_task_nc4_values = []
+        per_task_acc_values = []
+        per_task_iso_values = []
+        per_task_equi_values = []
+        per_task_samples_list = []
 
-            # compute per-task accuracy
+        for task_id in range(len(task_train_loaders)):
+            task_train_loader = task_train_loaders[task_id]
+
+            # compute per-task accuracy (on training set)
             task_correct, task_samples = 0, 0
             with torch.no_grad():
-                for images, labels in task_test_loader:
+                for images, labels in task_train_loader:
                     images, labels = images.to(self.device), labels.to(self.device)
                     logits = net(images)
                     task_correct += (logits.argmax(dim=1) == labels).sum().item()
@@ -829,19 +941,98 @@ class IncrementalCIFARExperiment(Experiment):
 
             # compute per-task NC metrics
             try:
-                tnc1, tnc2, tnc3, tnc3_max, tnc3_min, tnc4, t_iso, t_equi = self._compute_nc_on_simple_loader(net, task_test_loader)
+                tnc1, tnc2, tnc3, tnc3_max, tnc3_min, tnc4, t_iso, t_equi = \
+                    self._compute_nc_on_simple_loader(net, task_train_loader)
             except Exception:
-                tnc1, tnc2, tnc3, tnc3_max, tnc3_min, tnc4, t_iso, t_equi = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                tnc1, tnc2, tnc3, tnc3_max, tnc3_min, tnc4, t_iso, t_equi = \
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+            per_task_nc3_values.append(tnc3)
+            per_task_nc1_values.append(tnc1)
+            per_task_nc2_values.append(tnc2)
+            per_task_nc4_values.append(tnc4)
+            per_task_acc_values.append(task_acc)
+            per_task_iso_values.append(t_iso)
+            per_task_equi_values.append(t_equi)
+            per_task_samples_list.append(task_samples)
 
             self._print("\t[Joint] Task {0}: acc={1:.4f}, NC1={2:.4f}, NC2={3:.4f}, NC3={4:.4f}, NC4={5:.4f}".format(
                 task_id, task_acc, tnc1, tnc2, tnc3, tnc4))
 
-            with open(per_task_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([task_id, task_acc, task_samples, tnc1, tnc2, tnc3, tnc4,
-                                 t_iso, t_equi])
+        # NC3 (final) 对齐 permuted MNIST 的 "Joint (final)" 口径：在与任务无关的标签空间上
+        # 取一个总参考值。CIFAR slot 侧池化后标签是跨 task 超类、与持续曲线不可比（池化槽中心
+        # 被超类均值拉到贴合 W_k，数值虚低），因此取 per-task 真实类口径的均值作为等价量
+        # —— MNIST 的 final 0.63 正是落在其 per-task 均值 0.655 下方一点。
+        nc3_lower_bound = min(per_task_nc3_values) if per_task_nc3_values else 0.0
+        nc3_max_task = max(per_task_nc3_values) if per_task_nc3_values else 0.0
+        nc3_final = float(np.mean(per_task_nc3_values)) if per_task_nc3_values else 0.0
+        self._print("\t[Joint] NC3 (final, per-task mean)={0:.4f} "
+                    "[lower bound min={1:.4f}, max={2:.4f}]".format(
+                        nc3_final, nc3_lower_bound, nc3_max_task))
 
-            joint_iso_equi.append((t_iso, t_equi))
+        # ---- merged loader 上的 NC（保留用于诊断对比）----
+        try:
+            nc1_m, nc2_m, nc3_m, _nc3_max_m, _nc3_min_m, nc4_m, _iso_m, _equi_m = \
+                self._compute_nc_on_simple_loader(net, train_loader)
+        except Exception as e:
+            self._print("\t[Joint] Merged NC failed: {0}".format(e))
+            nc1_m, nc2_m, nc3_m, nc3_max_m, nc3_min_m, nc4_m = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        self._print("\t[Joint] Merged NC3 (for reference only): {0:.4f}".format(nc3_m))
+
+        # ---- NC3 参数诊断：导出 merged loader 上 NC3 计算所需中间参数 ----
+        try:
+            self._dump_joint_nc3_diagnostic(net, train_loader, task_train_loaders, joint_dir)
+        except Exception as e:
+            self._print("\t[Joint] NC3 diagnostic failed: {0}".format(e))
+
+        # save results
+        # [P1 修复] 列名必须显式携带 partition 口径，杜绝旧版 “nc1 是 merged 口径、nc3 是
+        # per-task 口径” 混在同一行、被绘图脚本当成同一种量画进同一张图的问题：
+        #   *_merged   = 槽位超类口径（所有任务的类压到 5 个槽位；Σ_W 含槽内全部子簇散布，
+        #                只能与持续侧的 slot-partition 评估比较，见 eval_slot_partition_nc.py）
+        #   *_per_task = 每任务真实 5 类口径（与 nc_metrics.csv 的持续侧同口径，可直接比较）
+        # 其中 nc3_per_task_mean 即绘图所用的 "Joint (final)" 总参考线（等价于 permuted MNIST
+        # 的 joint final，见 line 937 注释）；nc3_per_task_min 仅作下界参考，不作 final。
+        nc1_per_task_mean = float(np.mean(per_task_nc1_values)) if per_task_nc1_values else 0.0
+        nc3_per_task_mean = nc3_final   # == per-task NC3 均值，绘图取此列作为 joint final
+        results_file = os.path.join(joint_dir, "joint_results.csv")
+        with open(results_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["num_tasks", "accuracy",
+                             "nc1_merged", "nc2_merged", "nc3_merged", "nc4_merged",
+                             "nc1_per_task_mean", "nc3_per_task_min", "nc3_per_task_mean",
+                             "nc3_per_task_max",
+                             "reached_threshold", "epochs_trained"])
+            writer.writerow([self.num_tasks, final_acc,
+                             nc1_m, nc2_m, nc3_m, nc4_m,
+                             nc1_per_task_mean, nc3_lower_bound, nc3_per_task_mean,
+                             nc3_max_task,
+                             joint_reached_threshold, epoch + 1])
+
+        # save model
+        torch.save(net.state_dict(), os.path.join(joint_dir, "joint_model.pth"))
+
+        # =====================================================================
+        # Per-task results: 保存逐任务的详细结果到 CSV
+        # =====================================================================
+        self._print("\n\t[Joint] Saving per-task results...")
+        per_task_file = os.path.join(joint_dir, "joint_per_task_results.csv")
+        with open(per_task_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["task_idx", "accuracy", "num_samples", "nc1", "nc2", "nc3", "nc4",
+                             "isotropy", "equinormity"])
+            for task_id in range(len(task_train_loaders)):
+                writer.writerow([task_id, per_task_acc_values[task_id],
+                                 per_task_samples_list[task_id],
+                                 per_task_nc1_values[task_id],
+                                 per_task_nc2_values[task_id],
+                                 per_task_nc3_values[task_id],
+                                 per_task_nc4_values[task_id],
+                                 per_task_iso_values[task_id],
+                                 per_task_equi_values[task_id]])
+
+        joint_iso_equi = list(zip(per_task_iso_values, per_task_equi_values))
 
         self._print("\t[Joint] Per-task results saved to {0}".format(per_task_file))
 
@@ -876,12 +1067,148 @@ class IncrementalCIFARExperiment(Experiment):
             nc3, nc3_max, nc3_min = NC3_full(model=net, data_loader=loader,
                                               num_classes=self.num_classes_per_task, use_cache=True)
             nc4 = NC4(model=net, data_loader=loader, num_classes=self.num_classes_per_task, use_cache=True)
+        # NC1 返回 tensor，统一转为 Python float
+        if isinstance(nc1, torch.Tensor):
+            nc1 = nc1.item()
         return nc1, nc2, nc3, nc3_max, nc3_min, nc4, equiangular, equinorm
+
+    def _dump_joint_nc3_diagnostic(self, net, merged_loader, task_loaders, joint_dir):
+        """
+        导出判断"拼接(merged) loader 上 NC3 为什么偏低"所需的全部中间参数。
+
+        在拼接数据集上，类别被重映射为 super-class：槽位 k 里同时装着各 task 的
+        第 k 个真实类（每 task 一个真实类子簇，共 num_tasks 个子簇）。因此 merged
+        上算出的 NC3_k = 1 - cos(W_k, m_k) 偏低有两种截然不同的解释，本诊断把两种
+        可能都暴露出来：
+          (A) 槽内真的塌缩 —— 各 task 子簇均值 m_{t,k} 彼此靠近、且都对齐 W_k；
+          (B) 平均掩盖碎片化 —— 各 m_{t,k} 相距很远，只是它们的(加权)平均恰好与
+              W_k 对齐，导致 merged 槽中心看着"塌缩"，实际子簇是分开的。
+
+        输出文件（均在 joint_dir 下）：
+          joint_nc3_diagnostic_merged.csv       —— merged loader 上逐槽参数（复现 NC3_full）
+          joint_nc3_diagnostic_subclusters.csv  —— 每个 (task, slot) 真实类子簇参数
+          joint_nc3_diagnostic_summary.txt      —— 汇总 + 碎片化指标
+        """
+        K = self.num_classes_per_task
+        device = self.device
+        eps = 1e-8
+        net.eval()
+
+        # ---- 1) merged loader 上的全局/逐槽均值 + 分类器行（与 NC3_full 同一 utils 实现）----
+        clear_feature_means_cache()
+        mu_G, mu_c_merged = _utils_get_feature_means(
+            model=net, data_loader=merged_loader, num_classes=K, use_cache=False)
+        W = _utils_get_classifier_weights(net).to(device).float()   # [K, D]
+        mu_G = mu_G.float()
+
+        # merged loader 逐槽样本数（只回读标签，不做前向）
+        cnt_merged = torch.zeros(K, dtype=torch.long, device=device)
+        for _, y in merged_loader:
+            cnt_merged += torch.bincount(y.to(device).long().flatten(), minlength=K)
+
+        w_norms = W.norm(dim=1)                       # [K]
+        W_n = W / (w_norms.unsqueeze(1) + eps)        # [K, D] 单位化行
+
+        mu_k_list = []
+        merged_rows = []   # [slot, n, w_norm, mu_norm, muG_norm, centered_norm, cos, nc3]
+        for k in range(K):
+            mu_k = mu_c_merged[k].float()
+            mu_k_list.append(mu_k)
+            m_k = mu_k - mu_G
+            mn = m_k.norm()
+            m_n = m_k / (mn + eps)
+            cos_wm = float((W_n[k] * m_n).sum())
+            merged_rows.append([k, int(cnt_merged[k].item()),
+                                float(w_norms[k].item()),
+                                float(mu_k.norm().item()),
+                                float(mu_G.norm().item()),
+                                float(mn.item()), cos_wm, 1.0 - cos_wm])
+
+        merged_csv = os.path.join(joint_dir, "joint_nc3_diagnostic_merged.csv")
+        with open(merged_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["slot", "n_samples", "w_norm", "mu_k_norm", "mu_G_norm",
+                             "centered_norm_mk", "cos(W_k, m_k)", "nc3_k"])
+            writer.writerows(merged_rows)
+
+        # ---- 2) 每个 (task, slot) 真实类子簇参数（相对 merged 的全局均值 mu_G 中心化）----
+        sub_rows = []   # [task, slot, n, mu_norm, centered_norm, cos_w_sub, nc3_sub, dist_to_slot]
+        for t, tloader in enumerate(task_loaders):
+            clear_feature_means_cache()
+            _, mu_c_t = _utils_get_feature_means(
+                model=net, data_loader=tloader, num_classes=K, use_cache=False)
+            cnt_t = torch.zeros(K, dtype=torch.long, device=device)
+            for _, y in tloader:
+                cnt_t += torch.bincount(y.to(device).long().flatten(), minlength=K)
+            for k in range(K):
+                n_tk = int(cnt_t[k].item())
+                if n_tk == 0:      # 槽内该 task 无样本则跳过
+                    continue
+                mu_tk = mu_c_t[k].float()
+                m_tk = mu_tk - mu_G
+                mtn = m_tk.norm()
+                mtn_safe = m_tk / (mtn + eps)
+                cos_ws = float((W_n[k] * mtn_safe).sum())
+                dist_slot = float((mu_tk - mu_k_list[k]).norm().item())
+                sub_rows.append([t, k, n_tk,
+                                 float(mu_tk.norm().item()),
+                                 float(mtn.item()),
+                                 cos_ws, 1.0 - cos_ws, dist_slot])
+
+        sub_csv = os.path.join(joint_dir, "joint_nc3_diagnostic_subclusters.csv")
+        with open(sub_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["task", "slot", "n_samples", "mu_norm", "centered_norm_mtk",
+                             "cos(W_k, m_tk)", "nc3_sub", "dist_to_slot_center"])
+            writer.writerows(sub_rows)
+
+        # ---- 3) 汇总 + 碎片化指标 ----
+        nc3_merged_recomp = sum(r[7] for r in merged_rows) / K
+        lines = []
+        lines.append("=== Joint NC3 diagnostic (merged loader) ===")
+        lines.append("K (super-class slots) = {0}".format(K))
+        lines.append("num_tasks merged into each slot = {0}".format(len(task_loaders)))
+        lines.append("nc3 on merged loader (recomputed) = {0:.6f}".format(nc3_merged_recomp))
+        lines.append("")
+        lines.append("slot |  merged_nc3_k | subcluster cos(W,m): mean[min,max] | "
+                     "rms_dist_to_slot | slot_centered_norm | frag = rms/slot_norm")
+        for k in range(K):
+            cos_sub = [r[5] for r in sub_rows if r[1] == k]
+            dist_sub = [r[7] for r in sub_rows if r[1] == k]
+            if not dist_sub:
+                continue
+            rms_d = math.sqrt(sum(d * d for d in dist_sub) / len(dist_sub))
+            slot_norm = merged_rows[k][5]
+            frag = rms_d / (slot_norm + eps)
+            c_mean = sum(cos_sub) / len(cos_sub)
+            c_min = min(cos_sub)
+            c_max = max(cos_sub)
+            lines.append("  {0:3d} |      {1:.4f} |            {2:.3f} [{3:.3f},{4:.3f}] | "
+                         "{5:10.4f} |        {6:.4f} | {7:.3f}".format(
+                             k, merged_rows[k][7], c_mean, c_min, c_max,
+                             rms_d, slot_norm, frag))
+        lines.append("")
+        lines.append("判断标准：frag >> 1 表示槽内各 task 真实子簇显著分开，"
+                     "merged NC3 偏低主要来自平均掩盖(A->B判断);")
+        lines.append("frag << 1 且 cos(W,m_tk) 普遍接近 1 表示槽内真实塌缩。")
+
+        summary_txt = os.path.join(joint_dir, "joint_nc3_diagnostic_summary.txt")
+        with open(summary_txt, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        self._print("\t[Joint] NC3 diagnostic saved to:")
+        self._print("\t   {0}".format(merged_csv))
+        self._print("\t   {0}".format(sub_csv))
+        self._print("\t   {0}".format(summary_txt))
+        for line in lines:
+            self._print("\t" + line)
 
     # ----------------------------- Independent training ----------------------------- #
     def train_independent_models(self, training_data, val_data, test_data):
         """
-        Independent training: train a separate model from scratch for each task.
+        Independent training: train a separate model from scratch for each candidate task.
+        A task is accepted (used for joint/continual training) only if its final NC4
+        reaches self.nc4_threshold. Sampling continues until self.num_tasks are accepted.
         Results are saved to <results_dir>/independent/
         """
         indep_dir = os.path.join(self.results_dir, "independent")
@@ -889,63 +1216,66 @@ class IncrementalCIFARExperiment(Experiment):
         models_dir = os.path.join(indep_dir, "models")
         os.makedirs(models_dir, exist_ok=True)
 
+        # snapshot the full candidate pool (each entry is a 5-class array)
+        candidate_task_classes = list(self.task_classes)
+        num_candidates = len(candidate_task_classes)
+
         self._print("\n" + "=" * 60)
-        self._print("\t=== Independent Training: {0} tasks, each from scratch ===".format(self.num_tasks))
+        self._print("\t=== Independent Training: sample until {0} tasks reach NC4 >= {1:.2f} ===".format(
+            self.num_tasks, self.nc4_threshold))
+        self._print("\t=== Candidate pool: {0} tasks ===".format(num_candidates))
         self._print("=" * 60)
 
-        # collect all task data
+        # collect all candidate task data
         train_list, val_list, test_list = self._collect_all_tasks_data(
             training_data, val_data, test_data
         )
 
-        # final results file (one row per task)
+        # final results file (one row per candidate task)
         results_file = os.path.join(indep_dir, "independent_results.csv")
         with open(results_file, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["task_idx", "nc1", "nc2", "nc3", "nc4",
-                             "isotropy", "equinormity",
-                             "accuracy", "reached_threshold", "epochs_trained"])
+            writer.writerow(["task_idx", "accepted", "nc1", "nc2", "nc3", "nc4",
+                             "isotropy", "equinormity", "accuracy", "epochs_trained"])
 
         # intermediate file (per-epoch details)
         intermediate_file = os.path.join(indep_dir, "independent_intermediate.csv")
         with open(intermediate_file, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["task_idx", "epoch", "train_loss", "train_acc",
-                             "test_loss", "test_acc", "nc1", "nc2", "nc3", "nc4"])
+                             "train_eval_loss", "train_eval_acc", "nc1", "nc2", "nc3", "nc4"])
 
-        indep_iso_equi = []  # 收集每个独立 task 的 (isotropy, equinormity)
-        for task_id in range(self.num_tasks):
-            self._print("\n\t--- Independent Task {0}/{1} ---".format(task_id + 1, self.num_tasks))
+        accepted_classes = []      # 接受（NC4 达标）的 task 的 5 类
+        accepted_iso_equi = []     # 对应 (isotropy, equinormity)
+        num_accepted = 0
+
+        for task_id in range(num_candidates):
+            if num_accepted >= self.num_tasks:
+                break
+
+            self._print("\n\t--- Independent Candidate Task {0}/{1} ---".format(task_id + 1, num_candidates))
 
             # create fresh model per task
             net, optim = self._create_fresh_model_and_optimizer()
             loss_fn = torch.nn.CrossEntropyLoss(reduction="mean")
             indep_learner = build_learner(
                 agent="bp", net=net, optim=optim, loss_fn=loss_fn, device=self.device,
+                weight_decay=self.weight_decay,
             )
 
-            # build datasets for this task
+            # build dataset for this task
             train_dataset = self._make_simple_dataset(train_list[task_id])
-            val_dataset = self._make_simple_dataset(val_list[task_id])
-            test_dataset = self._make_simple_dataset(test_list[task_id])
 
             train_loader = DataLoader(train_dataset, batch_size=self.batch_sizes["train"],
                                       shuffle=True, num_workers=self.num_workers)
-            val_loader = DataLoader(val_dataset, batch_size=self.batch_sizes["validation"],
-                                    shuffle=False, num_workers=self.num_workers)
-            test_loader = DataLoader(test_dataset, batch_size=self.batch_sizes["test"],
-                                     shuffle=False, num_workers=self.num_workers)
 
-            task_reached_threshold = False
-            best_val_acc = 0.0
+            # ---- NC4-based early stopping state ----
+            best_nc4 = -1.0
             best_model_state = None
-            epochs_trained = 0
+            nc4_reached_target = False
+            epochs_trained = 0  # 实际训练的 epoch 数
 
-            for epoch in range(self.num_epochs_per_task):
-                if task_reached_threshold:
-                    break
-                epochs_trained = epoch + 1
-
+            for epoch in range(self.independent_epochs):
                 # ---- train one epoch ----
                 net.train()
                 total_loss, total_correct, total_samples = 0.0, 0, 0
@@ -965,85 +1295,86 @@ class IncrementalCIFARExperiment(Experiment):
                 train_loss = total_loss / total_samples
                 train_acc = total_correct / total_samples
 
-                # ---- evaluate ----
+                # ---- evaluate on training set ----
                 net.eval()
-                test_loss, test_correct, test_samples = 0.0, 0, 0
+                train_eval_loss, train_eval_correct, train_eval_samples = 0.0, 0, 0
                 with torch.no_grad():
-                    for images, labels in test_loader:
+                    for images, labels in train_loader:
                         images, labels = images.to(self.device), labels.to(self.device)
                         labels_oh = torch.nn.functional.one_hot(labels, num_classes=self.num_classes_per_task).float()
                         logits = net(images)
-                        test_loss += loss_fn(logits, labels_oh).item() * images.size(0)
-                        test_correct += (logits.argmax(dim=1) == labels).sum().item()
-                        test_samples += images.size(0)
-                test_loss_val = test_loss / test_samples
-                test_acc = test_correct / test_samples
+                        train_eval_loss += loss_fn(logits, labels_oh).item() * images.size(0)
+                        train_eval_correct += (logits.argmax(dim=1) == labels).sum().item()
+                        train_eval_samples += images.size(0)
+                train_eval_loss_val = train_eval_loss / train_eval_samples
+                train_eval_acc = train_eval_correct / train_eval_samples
 
-                # track best val model
-                val_correct, val_samples = 0, 0
-                with torch.no_grad():
-                    for images, labels in val_loader:
-                        images, labels = images.to(self.device), labels.to(self.device)
-                        logits = net(images)
-                        val_correct += (logits.argmax(dim=1) == labels).sum().item()
-                        val_samples += images.size(0)
-                val_acc = val_correct / val_samples
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    best_model_state = deepcopy(net.state_dict())
-
-                # ---- NC every 10 epochs ----
-                nc1, nc2, nc3, nc3_max, nc3_min, nc4 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-                _iso, _equi = 0.0, 0.0
-                if (epoch + 1) % 10 == 0:
+                # ---- compute NC periodically and check NC4 early stop ----
+                nc1_e, nc2_e, nc3_e, nc4_e = 0.0, 0.0, 0.0, 0.0
+                if (epoch + 1) % self.independent_nc_check_interval == 0:
                     try:
-                        nc1, nc2, nc3, nc3_max, nc3_min, nc4, _iso, _equi = self._compute_nc_on_simple_loader(net, test_loader)
+                        nc1_e, nc2_e, nc3_e, _nc3x, _nc3n, nc4_e, _iso, _equi = \
+                            self._compute_nc_on_simple_loader(net, train_loader)
+                        if nc4_e > best_nc4:
+                            best_nc4 = nc4_e
+                            best_model_state = deepcopy(net.state_dict())
+                        if nc4_e >= self.independent_nc4_target:
+                            self._print("\t[Independent Task {0}] NC4={1:.4f} >= target={2:.2f} "
+                                        "at epoch {3}, early stopping.".format(
+                                            task_id, nc4_e, self.independent_nc4_target, epoch + 1))
+                            nc4_reached_target = True
                     except Exception as e:
-                        pass
+                        self._print("\t[Independent Task {0}] NC computation failed "
+                                    "at epoch {1}: {2}".format(task_id, epoch + 1, e))
 
-                # save intermediate
+                # save intermediate (includes NC columns when computed, 0.0 otherwise)
                 with open(intermediate_file, "a", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow([task_id, epoch + 1, train_loss, train_acc,
-                                     test_loss_val, test_acc, nc1, nc2, nc3, nc4])
+                                     train_eval_loss_val, train_eval_acc,
+                                     nc1_e, nc2_e, nc3_e, nc4_e])
 
-                # 使用 train_acc 做 early stopping
-                if train_acc >= self.target_accuracy:
-                    task_reached_threshold = True
-                    self._print("\t[Independent Task {0}] Target train accuracy reached at epoch {1} (train_acc={2:.3f})".format(
-                        task_id, epoch + 1, train_acc))
+                epochs_trained = epoch + 1
+                if nc4_reached_target:
+                    break
 
-            # restore best model
+            # restore best model (by NC4) if we tracked one
             if best_model_state is not None:
                 net.load_state_dict(best_model_state)
+                self._print("\t[Independent Task {0}] Restored best model (NC4={1:.4f}) "
+                            "after {2} epochs.".format(task_id, best_nc4, epochs_trained))
 
-            # final NC
+            # final NC (on the best model, on training set)
             net.eval()
             try:
-                nc1, nc2, nc3, nc3_max, nc3_min, nc4, iso, equi = self._compute_nc_on_simple_loader(net, test_loader)
+                nc1, nc2, nc3, nc3_max, nc3_min, nc4, iso, equi = self._compute_nc_on_simple_loader(net, train_loader)
             except Exception:
                 nc1, nc2, nc3, nc3_max, nc3_min, nc4, iso, equi = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
-            # final accuracy
+            # final accuracy (on training set)
             final_correct, final_samples = 0, 0
             with torch.no_grad():
-                for images, labels in test_loader:
+                for images, labels in train_loader:
                     images, labels = images.to(self.device), labels.to(self.device)
                     logits = net(images)
                     final_correct += (logits.argmax(dim=1) == labels).sum().item()
                     final_samples += images.size(0)
             final_acc = final_correct / final_samples
 
-            self._print("\t[Independent Task {0}] Final acc={1:.4f}, NC1={2:.4f}, NC2={3:.4f}, NC3={4:.4f}, NC4={5:.4f}".format(
-                task_id, final_acc, nc1, nc2, nc3, nc4))
+            # NC4 gating: only accept this task if its NC4 reaches the threshold
+            accepted = 1 if nc4 >= self.nc4_threshold else 0
+            if accepted:
+                accepted_classes.append(candidate_task_classes[task_id])
+                accepted_iso_equi.append((iso, equi))
+                num_accepted += 1
+
+            self._print("\t[Independent Candidate {0}] acc={1:.4f}, NC1={2:.4f}, NC2={3:.4f}, NC3={4:.4f}, NC4={5:.4f} -> {6}".format(
+                task_id, final_acc, nc1, nc2, nc3, nc4, "ACCEPTED" if accepted else "rejected"))
 
             # save task results
             with open(results_file, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([task_id, nc1, nc2, nc3, nc4, iso, equi, final_acc,
-                                 task_reached_threshold, epochs_trained])
-
-            indep_iso_equi.append((iso, equi))
+                writer.writerow([task_id, accepted, nc1, nc2, nc3, nc4, iso, equi, final_acc, epochs_trained])
 
             # save model
             torch.save(net.state_dict(), os.path.join(models_dir, "independent_model_task_{0}.pth".format(task_id)))
@@ -1051,24 +1382,31 @@ class IncrementalCIFARExperiment(Experiment):
             del net, optim, indep_learner
             torch.cuda.empty_cache()
 
-        # 输出 plot_isotropy_equinormity.py 所需的独立训练文件
+        # 用接受的 task 作为联合/持续训练的数据来源
+        self.task_classes = accepted_classes
+
+        if num_accepted < self.num_tasks:
+            self._print("\n\t[Independent] WARNING: only {0}/{1} tasks reached NC4 >= {2:.2f}. "
+                        "Joint/continual will use {0} tasks.".format(
+                            num_accepted, self.num_tasks, self.nc4_threshold))
+            # 缩减任务数，避免持续训练越界索引 task_classes
+            self.num_tasks = len(self.task_classes)
+            self.num_epochs = self.num_tasks * self.num_epochs_per_task
+
+        # 输出 plot_isotropy_equinormity.py 所需的独立训练文件（仅 accepted task）
         indep_plot_file = os.path.join(self.results_dir, "independent_final_results.csv")
         with open(indep_plot_file, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["task_idx", "isotropy", "equinormity"])
-            for task_id in range(self.num_tasks):
-                writer.writerow([
-                    task_id,
-                    indep_iso_equi[task_id][0],
-                    indep_iso_equi[task_id][1],
-                ])
+            for i, (iso, equi) in enumerate(accepted_iso_equi):
+                writer.writerow([i, iso, equi])
         self._print("\t[Independent] Plot-compatible isotropy/equinormity saved to {0}".format(indep_plot_file))
 
-        self._print("\t[Independent] All tasks done. Results saved to {0}".format(indep_dir))
+        self._print("\t[Independent] Accepted {0} tasks, saved to {1}".format(num_accepted, indep_dir))
 
     # ------------------------------------- For running the experiment ------------------------------------- #
     def run(self):
-        # load data (full CIFAR-100, after train/val split but before any class filtering)
+        # load data (full dataset, after train/val split but before any class filtering)
         training_data, training_dataloader = self.get_data(train=True, validation=False)
         val_data, val_dataloader = self.get_data(train=True, validation=True)
         test_data, test_dataloader = self.get_data(train=False)
@@ -1078,60 +1416,63 @@ class IncrementalCIFARExperiment(Experiment):
         self._store_base_data_single(val_data, self.base_data, "val")
         self._store_base_data_single(test_data, self.base_data, "test")
 
-        # pre-create per-task test data snapshots for multi-task evaluation
-        for task_id in range(self.num_tasks):
-            # create a temporary filtered copy of the test data
-            task_classes = self.all_classes[task_id * self.num_classes_per_task:
-                                            (task_id + 1) * self.num_classes_per_task]
-            labels_full = self.base_data["test"]["labels"]
-            mask = labels_full[:, task_classes].sum(axis=1) > 0
-            self.per_task_test_data.append({
-                "data": self.base_data["test"]["data"][mask].copy(),
-                "labels": labels_full[mask][:, task_classes].copy(),
-                "classes": task_classes.copy(),
-            })
-
         # load checkpoint if one is available
         self.load_experiment_checkpoint()
 
         # =====================================================================
-        # ① Joint Training: all tasks' data concatenated, one model from scratch
+        # ① Independent Training (also performs NC4 gating to select tasks)
+        # =====================================================================
+        if self.enable_independent_training:
+            self.train_independent_models(training_data, val_data, test_data)
+        else:
+            # fallback: without independent gating, use the first num_tasks candidates
+            self.task_classes = self.task_classes[:self.num_tasks]
+
+        # pre-create per-task training data snapshots for multi-task evaluation
+        # (built AFTER gating so it only contains the accepted tasks)
+        for task_classes in self.task_classes:
+            labels_full = self.base_data["train"]["labels"]
+            mask = labels_full[:, task_classes].sum(axis=1) > 0
+            self.per_task_train_data.append({
+                "data": self.base_data["train"]["data"][mask].copy(),
+                "labels": labels_full[mask][:, task_classes].copy(),
+                "classes": task_classes.copy(),
+            })
+
+        # =====================================================================
+        # ② Joint Training: accepted tasks' data concatenated, one model from scratch
         # =====================================================================
         if self.enable_joint_training:
             self.train_joint_model(training_data, val_data, test_data)
 
         # =====================================================================
-        # ② Continual Training: one model, sequential tasks (existing logic)
+        # ③ Continual Training: one model, sequential accepted tasks
         # =====================================================================
-        # set up data for task 0 (the train loop handles task switching thereafter)
-        self._restore_from_base(training_data, self.base_data["train"])
-        self._restore_from_base(val_data, self.base_data["val"])
-        self._restore_from_base(test_data, self.base_data["test"])
-        self._remap_labels_to_task(training_data, self.current_task)
-        self._remap_labels_to_task(val_data, self.current_task)
-        self._remap_labels_to_task(test_data, self.current_task)
-        training_dataloader = self._create_dataloader(training_data, "train")
-        val_dataloader = self._create_dataloader(val_data, "validation")
-        test_dataloader = self._create_dataloader(test_data, "test")
+        if self.enable_continual_training:
+            # set up data for task 0 (the train loop handles task switching thereafter)
+            self._restore_from_base(training_data, self.base_data["train"])
+            self._restore_from_base(val_data, self.base_data["val"])
+            self._restore_from_base(test_data, self.base_data["test"])
+            self._remap_labels_to_task(training_data, self.current_task)
+            self._remap_labels_to_task(val_data, self.current_task)
+            self._remap_labels_to_task(test_data, self.current_task)
+            training_dataloader = self._create_dataloader(training_data, "train")
+            val_dataloader = self._create_dataloader(val_data, "validation")
+            test_dataloader = self._create_dataloader(test_data, "test")
 
-        # train network
-        self.train(train_dataloader=training_dataloader, test_dataloader=test_dataloader, val_dataloader=val_dataloader,
-                   test_data=test_data, training_data=training_data, val_data=val_data)
+            # train network
+            self.train(train_dataloader=training_dataloader, test_dataloader=test_dataloader, val_dataloader=val_dataloader,
+                       test_data=test_data, training_data=training_data, val_data=val_data)
 
-        # final evaluation: after all tasks, evaluate on every task
-        self._print("\n\t=== Final evaluation on all tasks ===")
-        self._evaluate_all_seen_tasks(test_data)
-        self.results_dict["task_accuracies"] = self.task_accuracies.cpu()
-        self._print("\tFinal per-task accuracies:\n{0}".format(self.task_accuracies))
-        self._save_task_accuracies_csv()
-        # save NC metrics as a CSV for plotting
-        self._save_nc_csv()
+            # final evaluation: after all tasks, evaluate on every task
+            self._print("\n\t=== Final evaluation on all tasks ===")
+            self._evaluate_all_seen_tasks(training_data)
+            self.results_dict["task_accuracies"] = self.task_accuracies.cpu()
+            self._print("\tFinal per-task accuracies:\n{0}".format(self.task_accuracies))
+            self._save_task_accuracies_csv()
+            # save NC metrics as a CSV for plotting
+            self._save_nc_csv()
 
-        # =====================================================================
-        # ③ Independent Training: one fresh model per task
-        # =====================================================================
-        if self.enable_independent_training:
-            self.train_independent_models(training_data, val_data, test_data)
         # store results using exp.store_results()
 
     def get_data(self, train: bool = True, validation: bool = False):
@@ -1143,17 +1484,26 @@ class IncrementalCIFARExperiment(Experiment):
         :return: data set, data loader
         """
 
-        """ Loads CIFAR data set """
-        cifar_data = CifarDataSet(root_dir=self.data_path,
-                                  train=train,
-                                  cifar_type=100,
-                                  device=None,
-                                  image_normalization="max",
-                                  label_preprocessing="one-hot",
-                                  use_torch=True)
+        """ Load data set (CIFAR-100 or Tiny ImageNet) """
+        if self.dataset == "tiny_imagenet":
+            cifar_data = TinyImageNetDataSet(root_dir=self.data_path,
+                                             train=train,
+                                             device=None,
+                                             image_normalization="max",
+                                             label_preprocessing="one-hot",
+                                             use_torch=True,
+                                             num_images_per_class=self.num_images_per_class)
+        else:
+            cifar_data = CifarDataSet(root_dir=self.data_path,
+                                      train=train,
+                                      cifar_type=100,
+                                      device=None,
+                                      image_normalization="max",
+                                      label_preprocessing="one-hot",
+                                      use_torch=True)
 
-        mean = (0.5071, 0.4865, 0.4409)
-        std = (0.2673, 0.2564, 0.2762)
+        mean = self.mean
+        std = self.std
 
         transformations = [
             ToTensor(swap_color_axis=True),  # reshape to (C x H x W)
@@ -1162,7 +1512,7 @@ class IncrementalCIFARExperiment(Experiment):
 
         if not validation:
             transformations.append(RandomHorizontalFlip(p=0.5))
-            transformations.append(RandomCrop(size=32, padding=4, padding_mode="reflect"))
+            transformations.append(RandomCrop(size=self.image_dims[0], padding=4, padding_mode="reflect"))
             transformations.append(RandomRotator(degrees=(0,15)))
 
         cifar_data.set_transformation(transforms.Compose(transformations))
@@ -1185,10 +1535,10 @@ class IncrementalCIFARExperiment(Experiment):
         :param cifar_data: and instance of CifarDataSet
         :return: train and validation indices
         """
-        num_val_samples_per_class = 50
-        num_train_samples_per_class = 450
-        validation_set_size = 5000
-        train_set_size = 45000
+        num_val_samples_per_class = self.num_val_samples_per_class
+        num_train_samples_per_class = self.num_train_samples_per_class
+        validation_set_size = num_val_samples_per_class * self.num_classes
+        train_set_size = num_train_samples_per_class * self.num_classes
 
         validation_indices = torch.zeros(validation_set_size, dtype=torch.int32)
         train_indices = torch.zeros(train_set_size, dtype=torch.int32)
@@ -1197,7 +1547,8 @@ class IncrementalCIFARExperiment(Experiment):
         for i in range(self.num_classes):
             class_indices = torch.argwhere(cifar_data.data["labels"][:, i] == 1).flatten()
             validation_indices[current_val_samples:(current_val_samples + num_val_samples_per_class)] += class_indices[:num_val_samples_per_class]
-            train_indices[current_train_samples:(current_train_samples + num_train_samples_per_class)] += class_indices[num_val_samples_per_class:]
+            # 训练集取 val 之后的样本，上限到 num_images_per_class（每类共 num_images_per_class 张）
+            train_indices[current_train_samples:(current_train_samples + num_train_samples_per_class)] += class_indices[num_val_samples_per_class:self.num_images_per_class]
             current_val_samples += num_val_samples_per_class
             current_train_samples += num_train_samples_per_class
 
@@ -1254,7 +1605,8 @@ class IncrementalCIFARExperiment(Experiment):
         self._print("[Task {0}] Pre-assessment loss: {1:.6f}".format(
             self.current_task, self.plasticity_loss_pre))
 
-        for e in tqdm(range(self.current_epoch, self.num_epochs)):
+        while self.current_epoch < self.num_epochs:
+            e = self.current_epoch  # 当前要训练的 epoch（early stopping 跳过时 e 会跳跃）
             self._print("\tEpoch number: {0}".format(e + 1))
             self.set_lr()
 
@@ -1285,14 +1637,14 @@ class IncrementalCIFARExperiment(Experiment):
             # store train accuracy for this epoch
             train_acc = epoch_train_correct / epoch_train_total if epoch_train_total > 0 else 0.0
             self.results_dict["train_accuracy_per_epoch"][e] = train_acc
-            self._store_test_summaries(test_dataloader, val_dataloader, epoch_number=e,
+            self._store_train_summaries(train_dataloader, epoch_number=e,
                                        epoch_runtime=epoch_end_time - epoch_start_time)
 
             self.current_epoch += 1
 
             # ========== 第一个 epoch 结束后，计算可塑性指标 ==========
             # 条件：刚完成的 epoch 是该 task 的第一个 epoch
-            if (self.current_epoch - 1) % self.num_epochs_per_task == 0:
+            if e % self.num_epochs_per_task == 0:
                 loss_post = self._compute_avg_loss_on_trainloader(train_dataloader)
                 params_after = self.net.state_dict()
                 delta_norm_total = self._compute_param_diff_norm(
@@ -1314,11 +1666,13 @@ class IncrementalCIFARExperiment(Experiment):
                     self.plasticity_loss_pre - loss_post, delta_norm_total))
 
             # --- 训练集准确率达标则提前结束当前 task ---
+            # 注意：必须用 eval 模式的全量准确率（test_accuracy_per_epoch），
+            # 而不是在线训练准确率（train_accuracy_per_epoch，虚高），否则会过早切 task。
             if self.current_epoch % self.num_epochs_per_task != 0:
-                recent_acc = self.results_dict["train_accuracy_per_epoch"][self.current_epoch - 1]
+                recent_acc = self.results_dict["test_accuracy_per_epoch"][e]
                 if recent_acc >= self.target_accuracy:
-                    next_task_boundary = ((self.current_epoch - 1) // self.num_epochs_per_task + 1) * self.num_epochs_per_task
-                    self._print("\n\t=== Target train accuracy {0:.2%} reached (got {1:.4f}) at epoch {2}. "
+                    next_task_boundary = (e // self.num_epochs_per_task + 1) * self.num_epochs_per_task
+                    self._print("\n\t=== Target eval accuracy {0:.2%} reached (got {1:.4f}) at epoch {2}. "
                                 "Skipping to next task. ===".format(
                                     self.target_accuracy, recent_acc, self.current_epoch))
                     self.current_epoch = next_task_boundary
@@ -1334,10 +1688,14 @@ class IncrementalCIFARExperiment(Experiment):
                 # ========== 刚完成的 task 的 NC 指标（无论是否还有下一个 task） ==========
                 self._print("\n\t=== Task {0} finished (epoch {1}) ===".format(
                     self.current_task, self.current_epoch))
+                # 先恢复到 eval 准确率最高的模型，再评估/算 NC，
+                # 否则报的是末态（可能已退化）模型，而不是 best 模型。
+                if self.early_stopping:
+                    self.net.load_state_dict(self.best_accuracy_model_parameters)
                 # evaluate on all seen tasks before switching
-                self._evaluate_all_seen_tasks(test_data)
+                self._evaluate_all_seen_tasks(training_data)
                 # compute NC metrics for the just-finished task (stored for later CSV export)
-                nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = self.compute_nc_metrics(test_data)
+                nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = self.compute_nc_metrics(training_data)
                 self.results_dict["nc1_per_task"][self.current_task] = nc1
                 self.results_dict["nc2_per_task"][self.current_task] = nc2
                 self.results_dict["nc3_per_task"][self.current_task] = nc3
@@ -1347,12 +1705,10 @@ class IncrementalCIFARExperiment(Experiment):
                 self.results_dict["isotropy_per_task"][self.current_task] = isotropy
                 self.results_dict["equinormity_per_task"][self.current_task] = equinormity
                 # save NC3 visualization data for t-SNE plotting
-                self._save_nc3_data(test_data)
+                self._save_nc3_data(training_data)
                 # record best accuracy for the just-finished task
                 self._print("\tBest accuracy in task {0}: {1:.4f}".format(
                     self.current_task, self.best_accuracy))
-                if self.early_stopping:
-                    self.net.load_state_dict(self.best_accuracy_model_parameters)
                 self.best_accuracy = torch.zeros_like(self.best_accuracy)
                 self.best_accuracy_model_parameters = {}
                 self._save_model_parameters()
@@ -1385,49 +1741,68 @@ class IncrementalCIFARExperiment(Experiment):
                         self.current_task, self.plasticity_loss_pre))
 
 
+    def _lr_for_epoch(self, epoch_in_block, block_len):
+        """
+        Return the LR for the given epoch index inside a training block, per self.lr_schedule.
+        Shared by continual (block = one task) and joint (block = the whole joint run) so that
+        both sides always follow the SAME LR protocol — otherwise the two NC values would be
+        measured at different LR states and would not be comparable.
+        Returns None when no schedule is configured (LR stays at self.stepsize).
+        """
+        if self.lr_schedule == "cosine":
+            # 余弦退火：block 内从 stepsize 平滑衰减到 stepsize * lr_min_ratio
+            progress = epoch_in_block / max(block_len - 1, 1)
+            lr_min = self.stepsize * self.lr_min_ratio
+            return lr_min + 0.5 * (self.stepsize - lr_min) * (1.0 + math.cos(math.pi * progress))
+        if self.lr_schedule == "step":
+            # 阶梯衰减：在 milestone epoch 处乘以 gamma
+            current_lr = self.stepsize
+            for milestone in sorted(self.lr_decay_milestones):
+                if epoch_in_block >= milestone:
+                    current_lr *= self.lr_decay_gamma
+            return current_lr
+        return None  # 无调度
+
     def set_lr(self):
-        """ Changes the learning rate of the optimizer according to the current epoch within the task """
-        current_stepsize = None
+        """Changes the learning rate according to the configured schedule (resets each task)."""
         epoch_in_task = self.current_epoch % self.num_epochs_per_task
+        current_lr = self._lr_for_epoch(epoch_in_task, self.num_epochs_per_task)
+        if current_lr is None:
+            return
+
+        for g in self.optim.param_groups:
+            g['lr'] = current_lr
+
+        # 每个 task 的第一个 epoch 打印 LR 信息
         if epoch_in_task == 0:
-            current_stepsize = self.stepsize
-        elif epoch_in_task == 60:
-            current_stepsize = round(self.stepsize * 0.2, 5)
-        elif epoch_in_task == 120:
-            current_stepsize = round(self.stepsize * (0.2 ** 2), 5)
-        elif epoch_in_task == 160:
-            current_stepsize = round(self.stepsize * (0.2 ** 3), 5)
+            self._print("\t[LR] schedule={0}, stepsize={1:.4f}, task_epochs={2}".format(
+                self.lr_schedule, self.stepsize, self.num_epochs_per_task))
 
-        if current_stepsize is not None:
-            for g in self.optim.param_groups:
-                g['lr'] = current_stepsize
-            self._print("\tCurrent stepsize: {0:.5f}".format(current_stepsize))
-
-    def _evaluate_all_seen_tasks(self, test_data: CifarDataSet):
+    def _evaluate_all_seen_tasks(self, training_data: CifarDataSet):
         """
         Evaluate the current model on all tasks seen so far, using the pre-stored
-        per-task test data snapshots. Records accuracies in self.task_accuracies.
+        per-task training data snapshots. Records accuracies in self.task_accuracies.
         This allows measuring plasticity (latest task) and forgetting (earlier tasks).
 
-        :param test_data: current test CifarDataSet (will be temporarily modified and restored)
+        :param training_data: current training CifarDataSet (will be temporarily modified and restored)
         """
-        # save current test data state
-        current_test_data = test_data.data["data"]
-        current_test_labels = test_data.data["labels"]
-        current_int_labels = list(test_data.integer_labels)
+        # save current training data state
+        current_train_data = training_data.data["data"]
+        current_train_labels = training_data.data["labels"]
+        current_int_labels = list(training_data.integer_labels)
 
         self.net.eval()
         for task_id in range(self.current_task + 1):
-            task_snapshot = self.per_task_test_data[task_id]
+            task_snapshot = self.per_task_train_data[task_id]
 
-            # temporarily inject task_id's test data into the CifarDataSet
-            test_data.data["data"] = task_snapshot["data"]
-            test_data.data["labels"] = task_snapshot["labels"]
-            test_data.integer_labels = [np.argmax(l) for l in task_snapshot["labels"]]
-            test_data.current_data = test_data.partition_data()
+            # temporarily inject task_id's training data into the CifarDataSet
+            training_data.data["data"] = task_snapshot["data"]
+            training_data.data["labels"] = task_snapshot["labels"]
+            training_data.integer_labels = [np.argmax(l) for l in task_snapshot["labels"]]
+            training_data.current_data = training_data.partition_data()
 
             # evaluate on this task
-            task_loader = self._create_dataloader(test_data, "test")
+            task_loader = self._create_dataloader(training_data, "train")
             avg_loss, avg_acc = self.evaluate_network(task_loader)
 
             self.task_accuracies[self.current_task, task_id] = avg_acc
@@ -1435,11 +1810,11 @@ class IncrementalCIFARExperiment(Experiment):
 
         self.net.train()
 
-        # restore current task's test data
-        test_data.data["data"] = current_test_data
-        test_data.data["labels"] = current_test_labels
-        test_data.integer_labels = current_int_labels
-        test_data.current_data = test_data.partition_data()
+        # restore current task's training data
+        training_data.data["data"] = current_train_data
+        training_data.data["labels"] = current_train_labels
+        training_data.integer_labels = current_int_labels
+        training_data.current_data = training_data.partition_data()
 
     def _save_model_parameters(self):
         """ Stores the parameters of the model, so it can be evaluated after the experiment is over """
@@ -1494,13 +1869,13 @@ def main():
     if "data_path" not in experiment_parameters.keys() or experiment_parameters["data_path"] == "":
         experiment_parameters["data_path"] = os.path.join(file_path, "data")
     if "results_dir" not in experiment_parameters.keys() or experiment_parameters["results_dir"] == "":
-        experiment_parameters["results_dir"] = os.path.join(file_path, "results")
+        experiment_parameters["results_dir"] = "result"
     if "experiment_name" not in experiment_parameters.keys() or experiment_parameters["experiment_name"] == "":
         experiment_parameters["experiment_name"] = os.path.splitext(os.path.basename(args.config))[0]
 
     initial_time = time.perf_counter()
     exp = IncrementalCIFARExperiment(experiment_parameters,
-                                     results_dir=os.path.join(experiment_parameters["results_dir"], experiment_parameters["experiment_name"]),
+                                     results_dir=os.path.join(file_path, experiment_parameters["results_dir"], experiment_parameters["experiment_name"]),
                                      run_index=args.experiment_index,
                                      verbose=args.verbose)
     exp.run()

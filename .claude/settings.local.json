@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "PowerShell(D:\\\\Anaconda\\\\envs\\\\lop\\\\python.exe -c \"import inspect; from mlproj_manager.experiments import Experiment; print\\(inspect.getsource\\(Experiment.load_experiment_checkpoint\\)\\)\")",
-      "PowerShell(D:\\\\Anaconda\\\\envs\\\\lop\\\\python.exe -c \"import inspect; from mlproj_manager.experiments import Experiment; print\\(inspect.getsource\\(Experiment.get_latest_checkpoint_filename\\)\\)\")"
+      "PowerShell(D:\\\\Anaconda\\\\envs\\\\lop\\\\python.exe -c \"import inspect; from mlproj_manager.experiments import Experiment; print\\(inspect.getsource\\(Experiment.get_latest_checkpoint_filename\\)\\)\")",
+      "Bash(/d/Anaconda/envs/lop/python.exe -c ' *)",
+      "Bash(python -c ' *)",
+      "Bash(cd \"c:/Users/YM/Desktop/科研/代码/PL_NC-pl_nc/loss_resnet/lop/incremental_cifar\" && sed -n '/def set_lr/,/^    def /p' incremental_cifar_experiment.py | head -40 && echo \"=== augmentation / transform ===\" && grep -n \"RandomCrop\\\\|RandomHorizontalFlip\\\\|Normalize\\\\|transform\\\\|augment\" incremental_cifar_experiment.py tiny_imagenet_dataset.py | head -20)",
+      "Bash(sort -t- -k3 -n)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\YM\\Desktop\\科研\\代码\\PL_NC-pl_nc\\loss_resnet\\lop\\incremental_cifar",
+      "C:\\Users\\YM\\Desktop\\科研\\代码\\PL_NC-pl_nc\\loss_resnet\\lop\\incremental_cifar"
     ]
   }
 }

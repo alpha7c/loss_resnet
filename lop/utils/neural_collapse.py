@@ -74,6 +74,10 @@ def _get_classifier_weights(model: nn.Module) -> torch.Tensor:
     适配DeepFFNN模型：提取输出层（layers.6）的权重
     确保权重维度为 [num_classes, feature_dim]
     """
+    # ResNet 风格：直接取 fc 分类头（显式分支，避免走异常回退路径）
+    if hasattr(model, 'fc') and isinstance(getattr(model, 'fc'), nn.Linear):
+        return model.fc.weight.data.clone()
+
     # 优先直接取输出层权重（从你的CSV保存代码可知输出层是layers.6）
     try:
         output_layer = model.layers[6]
@@ -116,7 +120,10 @@ def _get_feature_means(
     model.eval()
 
     # First batch to infer feature dimension D
-    first_inputs, first_targets = next(iter(data_loader))
+    # 注意：必须复用同一个迭代器，否则下面的 for 循环会从头再迭代一遍，
+    # 导致第一个 batch 被重复计入均值（double-count bug）。
+    loader_iter = iter(data_loader)
+    first_inputs, first_targets = next(loader_iter)
     first_inputs = first_inputs.to(device, non_blocking=True)
     first_feats = _extract_features(model, first_inputs)
     D = first_feats.shape[1]
@@ -134,8 +141,8 @@ def _get_feature_means(
             class_sum[c] += first_feats[mask].sum(dim=0)
             class_cnt[c] += mask.sum()
 
-    # remaining batches
-    for inputs, targets in data_loader:
+    # remaining batches（复用上面的迭代器，避免首批被重复计入）
+    for inputs, targets in loader_iter:
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True).long()
         feats = _extract_features(model, inputs)
@@ -233,8 +240,24 @@ def NC1(
         Sigma_B += d @ d.transpose(0, 1)
     Sigma_B = Sigma_B / max(num_classes, 1)
 
-    # ---- 标准伪逆（无额外 eps）----
-    pinv_SB = torch.linalg.pinv(Sigma_B)   # 不加任何 eps
+    # ---- 稳定伪逆：用 eigh 替代 SVD（对称矩阵特征分解更稳定）----
+    # Sigma_B 秩 <= K-1 = 9，远小于 D=512，SVD 极易不收敛
+    Sigma_B_sym = (Sigma_B + Sigma_B.T) / 2  # 确保数值对称
+    try:
+        eigenvalues, eigenvectors = torch.linalg.eigh(Sigma_B_sym)
+        # 截断小特征值：保留大于最大特征值 1e-6 倍的
+        max_eig = eigenvalues.abs().max()
+        threshold = max_eig * 1e-6 if max_eig > 0 else torch.tensor(1e-10, device=eigenvalues.device)
+        inv_eigenvalues = torch.where(
+            eigenvalues > threshold,
+            1.0 / eigenvalues.clamp(min=1e-10),
+            torch.zeros_like(eigenvalues)
+        )
+        pinv_SB = eigenvectors @ torch.diag(inv_eigenvalues) @ eigenvectors.T
+    except Exception:
+        # eigh 也失败时（极端情况），用强正则化兜底
+        reg = torch.trace(Sigma_B).abs() / Sigma_B.shape[0] * 1e-2 + 1e-6
+        pinv_SB = torch.linalg.pinv(Sigma_B + reg * torch.eye(Sigma_B.shape[0], device=Sigma_B.device, dtype=Sigma_B.dtype))
     val = torch.trace(Sigma_W @ pinv_SB) / num_classes
     return val.item()
 
@@ -426,17 +449,19 @@ def NC(
 
     loader = _rebatch_loader(data_loader, max_bs=128)
 
-    # nc1 = NC1(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    # nc2 = NC2(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    # nc3 = NC3(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    # nc4 = NC4(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
+    # ====================== 缓存优化 ======================
+    # 先清除旧模型/旧数据的特征均值缓存，然后在本次 NC 评估内部
+    # 让 NC1-NC4 共享同一轮特征均值计算（use_cache=True）。
+    # 否则每个指标各自把全数据集过一遍特征提取（ResNet 上开销 x4）。
+    clear_feature_means_cache()
+    inner_cache = True
 
-
-    nc1 = NC1(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    nc2, nc_equinorm, nc_equiangular = NC2(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    #nc3 = NC3(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    nc3, nc3_max, nc3_min = NC3(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
-    nc4 = NC4(model=model, data_loader=loader, num_classes=num_classes, use_cache=use_cache)
+    nc1 = NC1(model=model, data_loader=loader, num_classes=num_classes, use_cache=inner_cache)
+    nc2, nc_equinorm, nc_equiangular = NC2(model=model, data_loader=loader, num_classes=num_classes, use_cache=inner_cache)
+    nc3, nc3_max, nc3_min = NC3(model=model, data_loader=loader, num_classes=num_classes, use_cache=inner_cache)
+    nc4 = NC4(model=model, data_loader=loader, num_classes=num_classes, use_cache=inner_cache)
+    # 本次评估结束后清除缓存，防止下一次 NC 调用（模型已更新）复用旧均值
+    clear_feature_means_cache()
     # ====================== 【唯一正确的清理代码】 ======================
     import gc
     if torch.cuda.is_available():

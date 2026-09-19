@@ -120,6 +120,7 @@ class ResNet(nn.Module):
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[List[bool]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
+        in_channels: int = 3,
     ) -> None:
         super().__init__()
         _log_api_usage_once(self)
@@ -140,7 +141,7 @@ class ResNet(nn.Module):
             )
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1, bias=True)
+        self.conv1 = nn.Conv2d(in_channels, self.inplanes, kernel_size=3, stride=1, padding=1, bias=True)
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.layer1 = self._make_layer(block, 64, layers[0])
@@ -259,13 +260,14 @@ class ResNet(nn.Module):
         return x
 
 
-def build_resnet18(num_classes: int, norm_layer):
+def build_resnet18(num_classes: int, norm_layer, in_channels: int = 3):
     """
     :param num_classes: number of classes for the classification problem
     :param norm_layer: type of normalization. Options: [torch.nn.BatchNorm2d, torch.nn.Identity]
+    :param in_channels: number of input channels (3 for CIFAR, 1 for MNIST)
     :return: an instance of ResNet with the correct number of layers for ResNet34
     """
-    return ResNet(BasicBlock, layers=[1, 1, 1, 1], norm_layer=norm_layer, num_classes=num_classes)
+    return ResNet(BasicBlock, layers=[1, 1, 1, 1], norm_layer=norm_layer, num_classes=num_classes, in_channels=in_channels)
 
 
 def kaiming_init_resnet_module(nn_module: torch.nn.Module):

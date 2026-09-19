@@ -2,5 +2,12 @@
     "python.defaultInterpreterPath": "D:\\Anaconda\\envs\\lop\\python.exe",
     "python.analysis.extraPaths": [
         "${workspaceFolder}"
+    ],
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:conda",
+            "packageManager": "ms-python.python:conda"
+        }
     ]
 }

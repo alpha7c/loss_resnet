@@ -141,7 +141,7 @@ def generate_all_task_permutations(num_tasks, input_size, num_samples):
 
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '4'  # 强制只用GPU4，彻底杜绝设备漂移
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 使用第一张GPU
 
 import sys
 import json
@@ -168,6 +168,10 @@ from lop.nets.deep_ffnn import DeepFFNN
 from lop.utils.miscellaneous import nll_accuracy, compute_matrix_rank_summaries
 from lop.utils.neural_collapse import NC
 from cifar10_data import load_cifar10
+from mnist_data import load_mnist
+# ===== ResNet 迁移：复用 incremental_cifar 的模型与 learner 栈 =====
+from lop.nets.torchvision_modified_resnet import build_resnet18, kaiming_init_resnet_module
+from lop.incremental_cifar.learners import build_learner
 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
@@ -179,9 +183,20 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 plt.switch_backend('Agg')  
 
-dead_neuron_threshold = 1e-8    
+dead_neuron_threshold = 1e-8
 
 NUM_EPOCHS = 50
+
+# ===== ResNet 迁移全局开关（在 online_expr() 中按配置 net_type 设置）=====
+NET_TYPE = 'mlp'            # 'mlp' (DeepFFNN, 原逻辑) 或 'resnet' (ResNet-18)
+RESHAPE_TO_4D = False       # True 时 generate_task_samples 将排列后的扁平向量 reshape 为 [N,C,H,W]
+INPUT_CHANNELS = 3          # ResNet 输入通道数（CIFAR-10=3, MNIST=1）
+INPUT_H = 32                # ResNet 输入高度（CIFAR-10=32, MNIST=28）
+INPUT_W = 32                # ResNet 输入宽度（CIFAR-10=32, MNIST=28）
+EXAMPLES_PER_TASK = 50000   # 每个任务的样本数（CIFAR-10=50000, MNIST=60000）
+EVAL_BATCH_SIZE = 1000      # 评估/前向测试 batch size（ResNet 需调小防 OOM）
+TASK_ACC_THRESHOLD = 0.39   # 单任务/联合训练提前停止准确率阈值
+NC1_INTERVAL = 60000        # 训练中 NC 记录间隔（按 mini-batch 迭代数计，batch 变大时需相应调小）
 
 
 import copy
@@ -209,10 +224,18 @@ def compute_param_diff_norm(state_dict_before, state_dict_after):
     """
     计算两个参数字典之间的总 L2 范数差，以及各层的 L2 范数。
     返回 (total_norm, layer_norms_dict)
+
+    注意：ResNet 的 state_dict 中包含 BatchNorm 的 buffer
+    (running_mean / running_var / num_batches_tracked)。它们不是梯度
+    训练的参数（num_batches_tracked 还是 int64 计数器，平方后会严重
+    虚高 Δθ），计算可塑性指标 P_n 时必须排除，否则与 MLP 结果不可比。
     """
+    _BN_BUFFER_KEYS = ('running_mean', 'running_var', 'num_batches_tracked')
     total_norm_sq = 0.0
     layer_norms = {}
     for key in state_dict_before.keys():
+        if any(bk in key for bk in _BN_BUFFER_KEYS):
+            continue  # 跳过 BN buffer，只统计可训练参数
         diff = state_dict_after[key] - state_dict_before[key]
         layer_norm_sq = torch.sum(diff ** 2).item()
         layer_norms[key] = math.sqrt(layer_norm_sq)
@@ -232,13 +255,18 @@ def train_one_epoch(learner, x_epoch, y_epoch, mini_batch_size, change_after, ex
     for start_idx in range(0, change_after, mini_batch_size):
         batch_x = x_shuffled[start_idx: start_idx + mini_batch_size]
         batch_y = y_shuffled[start_idx: start_idx + mini_batch_size]
-        learner.learn(x=batch_x.to(dev), target=batch_y.to(dev))
+        # 位置参数调用：同时兼容旧 Backprop.learn(x, target) 与新 BPLearner.learn(images, labels)
+        learner.learn(batch_x.to(dev), batch_y.to(dev))
         iter_count += 1
     return iter_count
 
 # ====================== 新增：通用死亡神经元计算函数 ======================
 def calculate_dead_neurons(learner, x_task, num_hidden_layers, dev):
     """通用函数：计算当前模型的死亡神经元数量（训练后调用）"""
+    # ResNet 等卷积网络没有 predict() 接口，且"逐神经元死亡"定义对
+    # 4D 卷积特征图不成立，返回 0 占位（保持 CSV 列数不变）
+    if not hasattr(learner.net, 'predict'):
+        return [0] * num_hidden_layers
     learner.net.eval()  # 评估模式，避免BatchNorm等影响
     with torch.no_grad():
         m = learner.net.predict(x_task[:20000])[1]  # 用前20000样本，和原逻辑一致
@@ -359,6 +387,14 @@ def calculate_dead_neurons(learner, x_task, num_hidden_layers, dev):
 
 
 def save_model_params_to_csv(model, save_dir, num_tasks):
+    # ===== ResNet：没有 in_layer/layers.* 等 MLP 层名 =====
+    # 逐参数展开写 CSV 会产生千万行级文件（ResNet-18 约 11M 参数），
+    # 完整参数已由 joint_model_*.pth (state_dict) 保存，此处跳过。
+    if not hasattr(model, 'in_layer'):
+        print(f"[Joint Training] Non-MLP model ({type(model).__name__}) detected: "
+              f"skipping per-layer CSV export (full state_dict already saved as .pth)")
+        return
+
     layer_groups = [
         {
             "layer_keys": ["in_layer.fc.weight", "in_layer.fc.bias"],
@@ -415,9 +451,15 @@ def save_model_params_to_csv(model, save_dir, num_tasks):
 def generate_task_samples(x_original, y_original, pixel_perm, data_perm, examples_per_task, dev):
     x_task = x_original[:, pixel_perm].clone()
     x_task, y_task = x_task[data_perm], y_original[data_perm].clone()
-    
+
     x_task = x_task[:examples_per_task].to(dev)
     y_task = y_task[:examples_per_task].to(dev)
+
+    # ===== ResNet：像素排列在扁平空间完成后，reshape 回 4D 图像 =====
+    # 排列破坏了空间结构，但每个任务的输入分布仍然不同，
+    # permuted-task 的实验语义得以保留（卷积先验失效属于预期）。
+    if RESHAPE_TO_4D and x_task.dim() == 2:
+        x_task = x_task.view(-1, INPUT_CHANNELS, INPUT_H, INPUT_W)
     return x_task, y_task
 
 
@@ -449,7 +491,7 @@ def forward_test(learner, tasks_permutations, x_original, y_original, current_ta
         with open(forward_test_file, 'w', encoding='utf-8') as f:
             f.write(','.join(headers) + '\n')
     
-    examples_per_task = 50000
+    examples_per_task = EXAMPLES_PER_TASK
     print(f"\n=== Forward Test: Evaluate current model on all historical tasks (T1~T{current_task_idx}) ===")
     
     # 遍历所有历史任务（0 ~ current_task_idx）
@@ -462,8 +504,8 @@ def forward_test(learner, tasks_permutations, x_original, y_original, current_ta
             x_original, y_original, pixel_perm, data_perm, examples_per_task, dev
         )
         task_dataset = TensorDataset(x_task, y_task)
-        task_dataloader = DataLoader(task_dataset, batch_size=1000)
-        
+        task_dataloader = DataLoader(task_dataset, batch_size=EVAL_BATCH_SIZE)
+
         # 计算准确率
         total_correct = 0
         total_samples = 0
@@ -516,26 +558,27 @@ def test_joint_model_per_task(joint_learner, tasks_permutations, x_original, y_o
     with open(per_task_acc_file, 'w', encoding='utf-8') as f:
         f.write('task_idx,accuracy,num_samples,num_tasks,nc1,nc2,nc3,nc4,isotropy,equinormity\n')
     
-    examples_per_task = 50000
-    print(f"\n[Joint Model Per-Task Test] Start testing {num_tasks} tasks (each with 50000 samples)...")
+    examples_per_task = EXAMPLES_PER_TASK
+    print(f"\n[Joint Model Per-Task Test] Start testing {num_tasks} tasks (each with {EXAMPLES_PER_TASK} samples)...")
     for task_idx, (pixel_perm, data_perm) in enumerate(tasks_permutations):
         print(f"  Testing Task {task_idx}...")
         
         x_task, y_task = generate_task_samples(
             x_original, y_original, pixel_perm, data_perm, examples_per_task, dev
         )
-        
+
+        # ===== 分批前向（ResNet 一次性对 50000 张图前向会 OOM）=====
+        task_dataset = TensorDataset(x_task, y_task)
+        task_dataloader = DataLoader(task_dataset, batch_size=EVAL_BATCH_SIZE)
         with torch.no_grad():
-            output = joint_learner.net(x_task)
-            preds = torch.argmax(output, dim=1)
-            
-            total_correct = (preds == y_task).sum().item()
+            total_correct = 0
+            for val_x, val_y in task_dataloader:
+                val_output = joint_learner.net(val_x)
+                preds = torch.argmax(val_output, dim=1)
+                total_correct += (preds == val_y).sum().item()
             total_samples = y_task.size(0)
             accuracy = total_correct / total_samples
-            
-            task_dataset = TensorDataset(x_task, y_task)
-            task_dataloader = DataLoader(task_dataset, batch_size=1000)  
-            #nc1, nc2, nc3, nc4 = NC(model=joint_learner.net, data_loader=task_dataloader, num_classes=10)
+
             nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = NC(model=joint_learner.net, data_loader=task_dataloader, num_classes=10)
             
             torch.cuda.empty_cache()
@@ -558,6 +601,54 @@ def test_joint_model_per_task(joint_learner, tasks_permutations, x_original, y_o
     joint_learner.net.train()
 
 def create_model(params, input_size, classes_per_task, num_hidden_layers, num_features, dev):
+    # ===================== ResNet-18 分支 =====================
+    # 复用 lop/incremental_cifar/learners.py 的 learner 栈：
+    #   bp/l2 -> BPLearner (SGD, l2 通过 weight_decay 实现)
+    #   cbp   -> CBPLearner (ResGnT, 支持 4D 卷积特征的 generate-and-test)
+    #   ewc   -> EWCLearner (ResNetEWC, 已兼容 (x,y) 元组 dataloader)
+    # 注意：input_size / num_features / num_hidden_layers 对 ResNet 无意义
+    if params.get('net_type', 'mlp') == 'resnet':
+        net = build_resnet18(num_classes=classes_per_task, norm_layer=torch.nn.BatchNorm2d, in_channels=INPUT_CHANNELS)
+        net.apply(kaiming_init_resnet_module)
+        net.layers_to_log = []   # 让 to_log 分支的遍历空转，避免 AttributeError
+
+        if params.get('to_perturb', False):
+            print("[Warning] ResNet learner 栈不支持 to_perturb（shrink-and-perturb），已忽略。")
+
+        step_size = params['step_size']
+        if isinstance(step_size, list):
+            step_size = step_size[0]
+
+        agent = params['agent']
+        agent_mapped = {'bp': 'bp', 'l2': 'bp', 'cbp': 'cbp', 'ewc': 'ewc'}.get(agent, agent)
+        if agent not in agent_mapped:
+            raise ValueError(f"net_type='resnet' 不支持 agent='{agent}'，可选: bp/l2/cbp/ewc")
+
+        optim = torch.optim.SGD(
+            net.parameters(),
+            lr=step_size,
+            momentum=params.get('momentum', 0.9),
+            weight_decay=params.get('weight_decay', 0),
+        )
+        learner = build_learner(
+            agent=agent_mapped,
+            net=net,
+            optim=optim,
+            loss_fn=torch.nn.CrossEntropyLoss(),
+            device=torch.device(dev) if not isinstance(dev, torch.device) else dev,
+            # CBP 参数
+            replacement_rate=params.get('replacement_rate', 1e-5),
+            maturity_threshold=params.get('maturity_threshold', params.get('mt', 1000)),
+            util_type=params.get('utility_function', 'contribution'),
+            # EWC 参数
+            ewc_lambda=params.get('ewc_lambda', 5000.0),
+            fisher_sample_size=params.get('ewc_fisher_sample_size', 2000),
+        )
+        learner.net = learner.net.to(dev)
+        learner.net.train()
+        return learner
+    # ===================== ResNet 分支结束 =====================
+
     if params['agent'] == 'linear':
         net = MyLinear(
             input_size=input_size, num_outputs=classes_per_task
@@ -603,8 +694,43 @@ def create_model(params, input_size, classes_per_task, num_hidden_layers, num_fe
             perturb_scale=params.get('perturb_scale', 0.1),
         )
     learner.net = learner.net.to(dev)
-    learner.net.train()  # 强制训练模式，防止被NC改成eval导致设备漂移   
+    learner.net.train()  # 强制训练模式，防止被NC改成eval导致设备漂移
     return learner
+
+
+def set_lr_for_epoch(learner, params, epoch_in_task, num_epochs_per_task):
+    """
+    按 task 内 epoch 设置学习率（移植自 incremental_cifar_experiment.set_lr）。
+    支持 'cosine'（余弦退火，每 task 重置）与 'step'（阶梯衰减）；
+    'none'/未配置时不做任何事（保持 MLP 原行为）。
+    兼容新旧两种 learner：新栈优化器在 learner.optim，旧栈在 learner.opt。
+    """
+    schedule = params.get('lr_schedule', 'none')
+    if schedule in (None, '', 'none'):
+        return
+    opt_obj = getattr(learner, 'optim', None) or getattr(learner, 'opt', None)
+    if opt_obj is None:
+        return
+
+    base_lr = params['step_size']
+    if isinstance(base_lr, list):
+        base_lr = base_lr[0]
+
+    if schedule == 'cosine':
+        lr_min_ratio = params.get('lr_min_ratio', 0.01)
+        progress = epoch_in_task / max(num_epochs_per_task - 1, 1)
+        lr_min = base_lr * lr_min_ratio
+        current_lr = lr_min + 0.5 * (base_lr - lr_min) * (1.0 + math.cos(math.pi * progress))
+    elif schedule == 'step':
+        current_lr = base_lr
+        for milestone in sorted(params.get('lr_decay_milestones', [])):
+            if epoch_in_task >= milestone:
+                current_lr *= params.get('lr_decay_gamma', 0.5)
+    else:
+        return
+
+    for g in opt_obj.param_groups:
+        g['lr'] = current_lr
 
 # def train_single_task(learner, x_original, y_original, task_idx, params, save_dir, traj_save_dir, 
 #                      num_hidden_layers, input_size, examples_per_task, change_after, 
@@ -677,7 +803,7 @@ def create_model(params, input_size, classes_per_task, num_hidden_layers, num_fe
 #             batch_x = x_epoch[start_idx: start_idx + mini_batch_size]
 #             batch_y = y_epoch[start_idx: start_idx + mini_batch_size]
             
-#             loss, network_output = learner.learn(x=batch_x.to(dev), target=batch_y.to(dev))
+#             loss, network_output = learner.learn(batch_x.to(dev), batch_y.to(dev))
             
 #             if params.get('to_log', False) and params['agent'] != 'linear':
 #                 for idx, layer_idx in enumerate(learner.net.layers_to_log):
@@ -903,8 +1029,8 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
         x_original, y_original, pixel_permutation, data_permutation, examples_per_task, dev
     )
     dataset = TensorDataset(x_task, y_task)
-    dataloader = DataLoader(dataset, batch_size=1000)
-    
+    dataloader = DataLoader(dataset, batch_size=EVAL_BATCH_SIZE)
+
     # ========== 预评估及可塑性指标（开始） ==========
     criterion = F.cross_entropy   # 与 Backprop 中的 F.cross_entropy 一致
     
@@ -920,12 +1046,13 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
     params_before = copy.deepcopy(learner.net.state_dict())
     # ========== 预评估结束 ==========
     
-    if params['agent'] != 'linear':
+    task_start_approx_ranks = []
+    task_start_dead_neurons = []
+    # ResNet 无 predict() 接口且秩/死亡神经元统计对 4D 卷积特征不成立，跳过（CSV 以 0 占位）
+    if params['agent'] != 'linear' and hasattr(learner.net, 'predict'):
         with torch.no_grad():
             new_idx = int(iter / rank_measure_period)
             m = learner.net.predict(x_task[:20000])[1]
-            task_start_approx_ranks = []
-            task_start_dead_neurons = []
             for rep_layer_idx in range(num_hidden_layers):
                 ranks[new_idx][rep_layer_idx], effective_ranks[new_idx][rep_layer_idx], \
                 approx_rank_val, approximate_ranks_abs[new_idx][rep_layer_idx] = \
@@ -945,13 +1072,16 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
             f.write(','.join(intermediate_headers) + '\n')
     
     num_epochs = NUM_EPOCHS
-    #task_reached_threshold = False  
+    #task_reached_threshold = False
     total_train_steps = change_after * num_epochs
-    nc1_interval = 60000  
-    
+    # NC 记录间隔按 mini-batch 迭代数计：batch 变大后每 epoch 迭代数变少，
+    # 需在配置里相应调小（如 bs=128 时每 epoch 约 391 次迭代）
+    nc1_interval = NC1_INTERVAL
+
     # ========== 第一步：单独执行第一个 epoch，用于计算可塑性指标 ==========
     epoch = 0
     print(f"\n[Task {task_idx}] Epoch {epoch+1}/{num_epochs} (Plasticity measurement epoch)")
+    set_lr_for_epoch(learner, params, epoch, num_epochs)
     
     epoch_permutation = np.random.permutation(examples_per_task)
     x_epoch = x_task[epoch_permutation]
@@ -963,7 +1093,7 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
         batch_x = x_epoch[start_idx: start_idx + mini_batch_size]
         batch_y = y_epoch[start_idx: start_idx + mini_batch_size]
         
-        loss, network_output = learner.learn(x=batch_x.to(dev), target=batch_y.to(dev))
+        loss, network_output = learner.learn(batch_x.to(dev), batch_y.to(dev))
         
         if params.get('to_log', False) and params['agent'] != 'linear':
             for idx, layer_idx in enumerate(learner.net.layers_to_log):
@@ -986,7 +1116,7 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
                     total_correct += (preds == val_y).sum().item()
                     total_samples += val_y.size(0)
             full_accuracy = total_correct / total_samples
-            if full_accuracy >= 0.39:  
+            if full_accuracy >= TASK_ACC_THRESHOLD:  
                 task_reached_threshold = True
                 print(f"[Task {task_idx}] Reached target accuracy {full_accuracy:.4f}, stopping early")
             
@@ -1079,7 +1209,8 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
             if task_reached_threshold:
                 break
             print(f"\n[Task {task_idx}] Epoch {epoch+1}/{num_epochs}")
-            
+            set_lr_for_epoch(learner, params, epoch, num_epochs)
+
             epoch_permutation = np.random.permutation(examples_per_task)
             x_epoch = x_task[epoch_permutation]
             y_epoch = y_task[epoch_permutation]
@@ -1089,7 +1220,7 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
                 batch_x = x_epoch[start_idx: start_idx + mini_batch_size]
                 batch_y = y_epoch[start_idx: start_idx + mini_batch_size]
                 
-                loss, network_output = learner.learn(x=batch_x.to(dev), target=batch_y.to(dev))
+                loss, network_output = learner.learn(batch_x.to(dev), batch_y.to(dev))
                 
                 if params.get('to_log', False) and params['agent'] != 'linear':
                     for idx, layer_idx in enumerate(learner.net.layers_to_log):
@@ -1112,7 +1243,7 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
                             total_correct += (preds == val_y).sum().item()
                             total_samples += val_y.size(0)
                     full_accuracy = total_correct / total_samples
-                    if full_accuracy >= 0.39:  
+                    if full_accuracy >= TASK_ACC_THRESHOLD:  
                         task_reached_threshold = True
                         print(f"[Task {task_idx}] Reached target accuracy {full_accuracy:.4f}, stopping early")
                     
@@ -1272,13 +1403,15 @@ def train_single_task(learner, x_original, y_original, task_idx, params, save_di
 
 def train_joint_model(params, tasks_permutations, x_original, y_original, save_dir, dev):
     n_tasks = len(tasks_permutations)
-    samples_per_task = 50000  
-    total_samples_per_epoch = n_tasks * samples_per_task  
+    samples_per_task = EXAMPLES_PER_TASK
+    total_samples_per_epoch = n_tasks * samples_per_task
     mini_batch_size = params.get('mini_batch_size', 1)
+    if NET_TYPE == 'resnet' and mini_batch_size < 16:
+        mini_batch_size = 128   # BatchNorm 限制，与 online_expr 中的守卫保持一致
     #num_epochs = 10  0
     num_epochs = NUM_EPOCHS
-    record_interval = total_samples_per_epoch // 6#diedai  
-    record_points = [i * record_interval for i in range(1, 7)]  
+    record_interval = total_samples_per_epoch // 1  # joint training 数据量大(180万)，每 epoch 评估 1 次 NC
+    record_points = [i * record_interval for i in range(1, 2)]  
     
     joint_intermediate_file = os.path.join(save_dir, 'joint_intermediate_results.csv')
     if not os.path.exists(joint_intermediate_file):
@@ -1291,7 +1424,7 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
 
     joint_x_list = []
     joint_y_list = []
-    examples_per_task = 50000
+    examples_per_task = EXAMPLES_PER_TASK
     for pixel_perm, data_perm in tasks_permutations:
         x_task, y_task = generate_task_samples(
             x_original, y_original, pixel_perm, data_perm, examples_per_task, dev
@@ -1303,8 +1436,12 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
     
     release_tensor_memory(*joint_x_list, *joint_y_list)
     
-    full_dataset = TensorDataset(joint_x, joint_y)
-    full_dataloader = DataLoader(full_dataset, batch_size=1000)  
+    # NC 评估用子集（180万样本全量评估太慢 ~20min，取 10万样本子集 ~1min）
+    nc_subset_size = min(100000, len(joint_x))
+    nc_indices = torch.randperm(len(joint_x))[:nc_subset_size]
+    nc_dataset = TensorDataset(joint_x[nc_indices], joint_y[nc_indices])
+    nc_dataloader = DataLoader(nc_dataset, batch_size=EVAL_BATCH_SIZE)
+    print(f"[Joint Training] NC eval subset: {nc_subset_size} / {len(joint_x)} samples")  
     
     input_size = joint_x.shape[1]
     classes_per_task = 10
@@ -1325,8 +1462,9 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
         y_epoch = joint_y[epoch_perm]
         
         print(f"\nJoint Training Epoch {epoch+1}/{num_epochs}")
-        current_total_samples = 0  
-        recorded_points = set()  
+        set_lr_for_epoch(learner, params, epoch, num_epochs)
+        current_total_samples = 0
+        recorded_points = set()
         
         pbar = tqdm(
             range(0, total_samples_per_epoch, mini_batch_size),
@@ -1339,14 +1477,14 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
             if len(batch_x) == 0:
                 continue
             
-            learner.learn(x=batch_x.to(dev), target=batch_y.to(dev))
+            learner.learn(batch_x.to(dev), batch_y.to(dev))
             epoch_iter += 1
             current_total_samples += len(batch_x)  
             total_trained_samples_global += len(batch_x)  
             
             for point in record_points:
                 if point not in recorded_points and current_total_samples >= point:
-                    nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = NC(model=learner.net, data_loader=full_dataloader, num_classes=10)
+                    nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = NC(model=learner.net, data_loader=nc_dataloader, num_classes=10)
                     # 改显存
                     torch.cuda.empty_cache()
                     gc.collect()
@@ -1358,7 +1496,7 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
                     total_correct = 0
                     total_samples_eval = 0
                     with torch.no_grad():
-                        for val_x, val_y in full_dataloader:
+                        for val_x, val_y in nc_dataloader:
                             val_output = learner.net(val_x)
                             preds = torch.argmax(val_output, dim=1)
                             total_correct += (preds == val_y).sum().item()
@@ -1377,7 +1515,7 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
                             f"{full_accuracy:.6f},{nc1:.6f},{nc2:.6f},{nc3:.6f},{nc4:.6f},{isotropy:.6f},{equinormity:.6f},{n_tasks}\n"
                         )
                     #0.96
-                    if full_accuracy >= 0.39:
+                    if full_accuracy >= TASK_ACC_THRESHOLD:
                         joint_reached_threshold = True
                         print(f"Joint Training Reached target accuracy {full_accuracy:.4f}, stopping early")
                         pbar.close()  
@@ -1392,7 +1530,7 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
         if joint_reached_threshold:
             break
     
-    nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = NC(model=learner.net, data_loader=full_dataloader, num_classes=10)
+    nc1, nc2, nc3, nc3_max, nc3_min, nc4, isotropy, equinormity = NC(model=learner.net, data_loader=nc_dataloader, num_classes=10)
     # 改显存
     torch.cuda.empty_cache()
     gc.collect()
@@ -1403,7 +1541,7 @@ def train_joint_model(params, tasks_permutations, x_original, y_original, save_d
     total_correct = 0
     total_samples_eval = 0
     with torch.no_grad():
-        for val_x, val_y in full_dataloader:
+        for val_x, val_y in nc_dataloader:
             val_output = learner.net(val_x)
             preds = torch.argmax(val_output, dim=1)
             total_correct += (preds == val_y).sum().item()
@@ -1480,11 +1618,12 @@ def train_independent_tasks(params, tasks_permutations, x_original, y_original, 
             x_original, y_original, pixel_perm, data_perm, examples_per_task, dev
         )
         dataset = TensorDataset(x_task, y_task)
-        dataloader = DataLoader(dataset, batch_size=1000)
+        dataloader = DataLoader(dataset, batch_size=EVAL_BATCH_SIZE)
         
         task_start_approx_ranks = []
         task_start_dead_neurons = []
-        if params['agent'] != 'linear':
+        # ResNet 无 predict() 接口，跳过秩/死亡神经元统计（CSV 以 0 占位）
+        if params['agent'] != 'linear' and hasattr(current_learner.net, 'predict'):
             with torch.no_grad():
                 new_idx = int(iter_count / rank_measure_period)
                 m = current_learner.net.predict(x_task[:20000])[1]
@@ -1503,13 +1642,14 @@ def train_independent_tasks(params, tasks_permutations, x_original, y_original, 
         num_epochs = NUM_EPOCHS
         task_reached_threshold = False
         total_train_steps = change_after * num_epochs
-        nc1_interval = 50000
-        
+        nc1_interval = NC1_INTERVAL   # 按 mini-batch 迭代数计，随 batch size 调整
+
         for epoch in range(num_epochs):
             if task_reached_threshold:
                 break
             print(f"\n[Independent Task {task_idx}] Epoch {epoch+1}/{num_epochs}")
-            
+            set_lr_for_epoch(current_learner, params, epoch, num_epochs)
+
             epoch_permutation = np.random.permutation(examples_per_task)
             x_epoch = x_task[epoch_permutation]
             y_epoch = y_task[epoch_permutation]
@@ -1519,7 +1659,7 @@ def train_independent_tasks(params, tasks_permutations, x_original, y_original, 
                 batch_x = x_epoch[start_idx: start_idx + mini_batch_size]
                 batch_y = y_epoch[start_idx: start_idx + mini_batch_size]
                 
-                loss, network_output = current_learner.learn(x=batch_x.to(dev), target=batch_y.to(dev))
+                loss, network_output = current_learner.learn(batch_x.to(dev), batch_y.to(dev))
                 
                 if params.get('to_log', False) and params['agent'] != 'linear':
                     for idx, layer_idx in enumerate(current_learner.net.layers_to_log):
@@ -1550,7 +1690,7 @@ def train_independent_tasks(params, tasks_permutations, x_original, y_original, 
                             total_samples += val_y.size(0)
                     full_accuracy = total_correct / total_samples
                     #0.96
-                    if full_accuracy >= 0.39:
+                    if full_accuracy >= TASK_ACC_THRESHOLD:
                         task_reached_threshold = True
                         print(f"[Independent Task {task_idx}] Reached target accuracy {full_accuracy:.4f}, stopping early")
                     
@@ -1628,16 +1768,28 @@ def train_independent_tasks(params, tasks_permutations, x_original, y_original, 
     print(f"Final results saved to: {independent_final_file}")
 
 def online_expr(params: dict):
+    # ===== 按配置初始化 ResNet 迁移全局开关 =====
+    global NET_TYPE, RESHAPE_TO_4D, EVAL_BATCH_SIZE, TASK_ACC_THRESHOLD, NC1_INTERVAL, NUM_EPOCHS
+    global INPUT_CHANNELS, INPUT_H, INPUT_W, EXAMPLES_PER_TASK
+    NET_TYPE = params.get('net_type', 'mlp')
+    RESHAPE_TO_4D = (NET_TYPE == 'resnet')
+    EVAL_BATCH_SIZE = params.get('eval_batch_size', 256 if NET_TYPE == 'resnet' else 1000)
+    TASK_ACC_THRESHOLD = params.get('task_accuracy_threshold', 0.39)
+    NC1_INTERVAL = params.get('nc1_interval', 60000)
+    NUM_EPOCHS = params.get('num_epochs', NUM_EPOCHS)
+    print(f"[Config] net_type={NET_TYPE}, eval_batch_size={EVAL_BATCH_SIZE}, "
+          f"task_acc_threshold={TASK_ACC_THRESHOLD}, nc1_interval={NC1_INTERVAL}, num_epochs={NUM_EPOCHS}")
+
     agent_type = params['agent']
     initial_num_tasks = 0
     max_task_increase = 600
-    target_accuracy = 0.39
+    target_accuracy = TASK_ACC_THRESHOLD
 
     num_tasks = params.get('num_tasks', 200)
     if 'num_examples' in params.keys() and "change_after" in params.keys():
         num_tasks = int(params["num_examples"] / params["change_after"])
 
-    save_dir = '30_cbp_cifar/'
+    save_dir = params.get('save_dir', '30_cbp_cifar/')
     os.makedirs(save_dir, exist_ok=True)
 
     zero_csv_path = os.path.join(save_dir, '0.csv')
@@ -1668,6 +1820,12 @@ def online_expr(params: dict):
     num_hidden_layers = params.get('num_hidden_layers', 1)
 
     mini_batch_size = params.get('mini_batch_size', 1)
+    # ResNet 含 BatchNorm：train 模式下 batch=1 会直接报错
+    # ("Expected more than 1 value per channel")，过小 batch 也会导致 BN 统计失真
+    if NET_TYPE == 'resnet' and mini_batch_size < 16:
+        print(f"[Warning] net_type='resnet' 时 mini_batch_size={mini_batch_size} 过小，"
+              f"已强制提升到 128（BatchNorm 限制）")
+        mini_batch_size = 128
     decay_rate = params.get('decay_rate', 0.99)
     maturity_threshold = params.get('mt', 100)
     util_type = params.get('util_type', 'adaptable_contribution')
@@ -1680,20 +1838,44 @@ def online_expr(params: dict):
     os.makedirs(nc_data_dir, exist_ok=True)
 
     classes_per_task = 10
-    images_per_class = 5000
-    #input_size = 784
-    
+
+    # ===== 数据集选择：cifar10 或 mnist =====
+    dataset_type = params.get('dataset', 'cifar10')
+    if dataset_type == 'mnist':
+        images_per_class = 6000
+        INPUT_CHANNELS = 1
+        INPUT_H = 28
+        INPUT_W = 28
+        EXAMPLES_PER_TASK = 60000
+        print(f"[Dataset] MNIST: 1x28x28, 60000 samples, 10 classes")
+    else:
+        images_per_class = 5000
+        INPUT_CHANNELS = 3
+        INPUT_H = 32
+        INPUT_W = 32
+        EXAMPLES_PER_TASK = 50000
+        print(f"[Dataset] CIFAR-10: 3x32x32, 50000 samples, 10 classes")
+
     examples_per_task = images_per_class * classes_per_task
-    
 
     # 加载数据
-    use_grayscale = params.get('cifar_grayscale', False)   # 默认 False，保持彩色
-    x_original, y_original, x_test, y_test = load_cifar10(
-        device=dev if use_gpu == 1 else 'cpu',
-        flatten=True,
-        use_grayscale=use_grayscale
-    )
-    input_size = x_original.shape[1]   # 自动获取：彩色 3072，灰度 1024
+    if dataset_type == 'mnist':
+        use_normalize = params.get('mnist_normalize', NET_TYPE == 'resnet')
+        x_original, y_original, x_test, y_test = load_mnist(
+            device=dev if use_gpu == 1 else 'cpu',
+            flatten=True,
+            normalize=use_normalize
+        )
+    else:
+        use_grayscale = params.get('cifar_grayscale', False)
+        use_normalize = params.get('cifar_normalize', NET_TYPE == 'resnet')
+        x_original, y_original, x_test, y_test = load_cifar10(
+            device=dev if use_gpu == 1 else 'cpu',
+            flatten=True,
+            use_grayscale=use_grayscale,
+            normalize=use_normalize
+        )
+    input_size = x_original.shape[1]   # 自动获取：MNIST 784, CIFAR 彩色 3072, 灰度 1024
 
     num_samples = len(y_original)
     task_params = []
@@ -1865,13 +2047,15 @@ def main(arguments):
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_cfg = os.path.join(script_dir, 'cfg', 'resnet_mnist.json')
     parser.add_argument('-c', help="Path to the config file for the experiment",
-                        type=str, default='temp_cfg/0.json')
+                        type=str, default=default_cfg)
     parser.add_argument('--change_after', type=int, default=None,
                         help="(optional) override change_after from config")
     args = parser.parse_args(arguments)
     cfg_file = args.c
-    with open(cfg_file, 'r') as f:
+    with open(cfg_file, 'r', encoding='utf-8') as f:
         params = json.load(f)
     if args.change_after is not None:
         params['change_after'] = int(args.change_after)

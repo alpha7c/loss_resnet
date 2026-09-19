@@ -3,7 +3,7 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 
-def load_cifar10(device='cpu', flatten=True, use_grayscale=False):
+def load_cifar10(device='cpu', flatten=True, use_grayscale=False, normalize=False):
     """
     加载 CIFAR-10 数据集，返回与原有 MNIST 加载格式完全兼容的张量。
 
@@ -11,6 +11,9 @@ def load_cifar10(device='cpu', flatten=True, use_grayscale=False):
         device: 目标设备 ('cpu' 或 'cuda')
         flatten: 是否将图像展平为一维向量
         use_grayscale: 是否转换为灰度图（默认 False，保留 RGB 三通道）
+        normalize: 是否用 CIFAR-10 均值/方差归一化（ResNet 训练建议开启）。
+                   注意：归一化在展平/像素排列之前完成，因此排列后的任务
+                   数据依然保持归一化分布。
 
     Returns:
         x_train: torch.Tensor, shape [50000, D] 或 [50000, C, H, W]
@@ -20,16 +23,29 @@ def load_cifar10(device='cpu', flatten=True, use_grayscale=False):
     """
     if use_grayscale:
         # 灰度图：32x32 = 1024 维
-        transform = transforms.Compose([
+        transform_list = [
             transforms.Grayscale(num_output_channels=1),
             transforms.ToTensor(),
-        ])
+        ]
+        if normalize:
+            # 灰度用 CIFAR-10 三通道均值的平均近似
+            gray_mean = sum((0.4914, 0.4822, 0.4465)) / 3.0
+            gray_std = sum((0.2470, 0.2435, 0.2616)) / 3.0
+            transform_list.append(transforms.Normalize((gray_mean,), (gray_std,)))
+        transform = transforms.Compose(transform_list)
         D = 1024
     else:
         # 彩色图：3x32x32 = 3072 维
-        transform = transforms.Compose([
+        transform_list = [
             transforms.ToTensor(),
-        ])
+        ]
+        if normalize:
+            # CIFAR-10 官方均值/方差（注意不是 CIFAR-100 的）
+            transform_list.append(transforms.Normalize(
+                mean=(0.4914, 0.4822, 0.4465),
+                std=(0.2470, 0.2435, 0.2616),
+            ))
+        transform = transforms.Compose(transform_list)
         D = 3072
 
     # 下载并加载训练集和测试集（如果已经下载过，不会重复下载）

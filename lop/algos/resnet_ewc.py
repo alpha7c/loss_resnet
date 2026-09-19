@@ -146,8 +146,16 @@ class ResNetEWC:
 
         n_samples = 0
         for batch in sample_loader:
-            images = batch["image"].to(self.device)
-            labels = batch["label"].to(self.device)
+            # 兼容两种 dataloader 格式：
+            #   - CifarDataSet 风格的 dict: {"image": ..., "label": ...}
+            #   - TensorDataset 风格的元组: (images, labels)
+            if isinstance(batch, dict):
+                images = batch["image"].to(self.device)
+                labels = batch["label"].to(self.device)
+            else:
+                images, labels = batch
+                images = images.to(self.device)
+                labels = labels.to(self.device)
 
             self.net.zero_grad()
             predictions = self.net.forward(images)

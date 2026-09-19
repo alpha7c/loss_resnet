@@ -1,0 +1,65 @@
+{
+  "_model_description_": "ResNet-18 on permuted CIFAR-10 (joint + continual + independent). 像素排列任务设置与原 MLP 实验一致：排列在扁平 3072 维空间完成后 reshape 回 [3,32,32]。",
+
+  "_comment_dataset_": "========== 数据集选择 ==========",
+  "dataset": "cifar10",
+
+  "_comment_net_": "========== 网络选择 ==========",
+  "_comment_net_desc_": "net_type: 'resnet' = ResNet-18 (build_resnet18 + kaiming init) | 'mlp' = 原 DeepFFNN",
+  "net_type": "resnet",
+
+  "_comment_agent_": "========== 算法选择 ==========",
+  "_comment_agent_desc_": "'bp': 标准 SGD | 'l2': bp + weight_decay | 'cbp': Continual Backprop (ResGnT) | 'ewc': EWC (ResNetEWC)",
+  "agent": "bp",
+
+  "_comment_task_": "========== 任务设置 ==========",
+  "_comment_num_tasks_": "注意: joint 训练会把 num_tasks x 50000 个样本全部放 GPU 并在每 epoch 做置换拷贝(约 x2 显存)。ResNet 下建议 <= 10。",
+  "num_tasks":30,
+  "change_after": 50000,
+  "num_epochs": 10,
+  "task_accuracy_threshold": 0.39,
+  "skip_threshold": 0.01,
+
+  "_comment_opt_": "========== 优化器 ==========",
+  "_comment_opt_desc_": "参照 incremental_cifar 的 ResNet 配置: SGD + momentum 0.9。step_size 若为列表则取第一个。",
+  "opt": "sgd",
+  "step_size": 0.01,
+  "momentum": 0.9,
+  "weight_decay": 0,
+  "mini_batch_size": 128,
+
+  "_comment_lr_": "========== LR schedule (每 task 内重置) ==========",
+  "_comment_lr_desc_": "lr_schedule: 'cosine' | 'step' | 'none'。cosine: 每 task 从 step_size 退火到 step_size*lr_min_ratio。step: 在 lr_decay_milestones(task 内 epoch) 处乘 lr_decay_gamma。",
+  "lr_schedule": "none",
+  "lr_min_ratio": 0.01,
+  "lr_decay_milestones": [20, 40],
+  "lr_decay_gamma": 0.5,
+
+  "_comment_data_": "========== 数据 ==========",
+  "_comment_data_desc_": "cifar_normalize: 用 CIFAR-10 均值/方差归一化(在像素排列之前完成)，ResNet 建议 true。cifar_grayscale: true 则输入 1024 维灰度(仍 reshape 为 1x32x32? 注意 resnet conv1 固定 3 通道, 灰度不可与 resnet 同用)。",
+  "data_dir": "data/resnet_cifar10/",
+  "save_dir": "30_resnet_cifar/",
+  "cifar_grayscale": false,
+  "cifar_normalize": true,
+  "use_gpu": 1,
+
+  "_comment_eval_": "========== 评估/记录 ==========",
+  "_comment_eval_desc_": "eval_batch_size: 评估与 NC 计算的前向 batch(ResNet 防止 OOM)。nc1_interval: 训练中 NC 记录间隔, 按 mini-batch 迭代数计; bs=128 时每 epoch 约 391 次迭代, 1955 约为每 5 个 epoch 记录一次。",
+  "eval_batch_size": 256,
+  "nc1_interval": 1955,
+  "to_log": false,
+  "to_perturb": false,
+
+  "_comment_mlp_compat_": "========== MLP 兼容占位 (resnet 下仅决定 CSV 列数) ==========",
+  "num_features": 200,
+  "num_hidden_layers": 3,
+
+  "_comment_cbp_": "========== CBP 参数 (agent='cbp' 时生效) ==========",
+  "replacement_rate": 1e-05,
+  "utility_function": "contribution",
+  "maturity_threshold": 1000,
+
+  "_comment_ewc_": "========== EWC 参数 (agent='ewc' 时生效) ==========",
+  "ewc_lambda": 5000.0,
+  "ewc_fisher_sample_size": 2000
+}
