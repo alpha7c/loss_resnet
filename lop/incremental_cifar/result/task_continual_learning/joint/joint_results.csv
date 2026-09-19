@@ -1,2 +1,0 @@
-num_tasks,accuracy,nc1_merged,nc2_merged,nc3_merged,nc4_merged,nc1_per_task_mean,nc3_per_task_min,nc3_per_task_mean,nc3_per_task_max,reached_threshold,epochs_trained
-30,0.6776,1.559790015220642,0.13861750066280365,0.036483585834503174,0.8118333333333333,1.0311437487602233,0.18637391924858093,0.2664866238832474,0.41008836030960083,False,100
